@@ -1,0 +1,188 @@
+"""
+Script 2: Cell-cell communication analysis (CellPhoneDB v5 and LIANA)
+Source: code.ipynb (CRC scRNA-seq analysis)
+Note: Jupyter magics are commented out; file names were translated to English.
+"""
+import os
+import shutil
+import copy
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import omicverse as ov
+import matplotlib.pyplot as plt
+
+ov.plot_set()
+adata = sc.read_h5ad("/ZXL/subtypes/epithelial.h5ad")
+
+
+# --------------------------------------------------------------------
+# CellPhoneDB v5
+# --------------------------------------------------------------------
+
+import shutil
+import os
+import copy
+
+# Remove previous temporary files and results
+if os.path.exists('./cpdb_results'):
+    shutil.rmtree('./cpdb_results')
+if os.path.exists('./temp_cpdb'):
+    shutil.rmtree('./temp_cpdb')
+
+# Back up the original X data and temporarily place counts in X
+original_X = adata.X  # back up the original data (possibly normalized)
+adata.X = adata.layers['counts']  # assign counts to X
+
+# Run again
+try:
+    cpdb_results, adata_cpdb = ov.single.run_cellphonedb_v5(
+        adata,
+        cpdb_file_path='./cellphonedb.zip',
+        celltype_key='Cell_subtype',
+        min_cell_fraction=0.005,
+        min_genes=200,
+        min_cells=3,
+        iterations=1000,
+        threshold=0.1,
+        pvalue=0.05,
+        threads=10,
+        output_dir='./cpdb_results',
+        cleanup_temp=True,
+    )
+finally:
+    # Restore the original data
+    adata.X = original_X
+
+if 'Cell_subtype_colors' not in adata.uns:
+    fallback_colors = (
+        ov.pl.red_color
+        + ov.pl.blue_color
+        + ov.pl.green_color
+        + ov.pl.orange_color
+        + ov.pl.purple_color
+    )
+    adata.uns['Cell_subtype_colors'] = fallback_colors[:len(adata.obs['Cell_subtype'].cat.categories)]
+
+color_dict = dict(zip(
+    adata.obs['Cell_subtype'].cat.categories,
+    adata.uns['Cell_subtype_colors']
+))
+
+adata_plot = adata if 'cpdb_results' in adata.uns else adata_cpdb
+comm_adata = ov.single.extract_comm_adata(adata, result_uns_key='cpdb_results') if 'cpdb_results' in adata.uns else adata_cpdb
+
+focus_pathway = 'Signaling by Fibroblast growth factor'
+focus_pair_lr = 'NCAM1_FGFR1'
+focus_ligand = 'FN1'
+
+umap_df = pd.DataFrame(
+    adata.obsm['X_umap'][:, :2],
+    columns=['x', 'y'],
+    index=adata.obs_names,
+)
+umap_df['cell_type'] = adata.obs['Cell_subtype'].astype(str).values
+node_positions = umap_df.groupby('cell_type', observed=True)[['x', 'y']].median()
+embedding_points = umap_df.reset_index(drop=True)
+
+comm_adata.uns['node_positions'] = node_positions
+comm_adata.uns['embedding_points'] = embedding_points
+comm_adata.uns['embedding_axes'] = ('UMAP_1', 'UMAP_2')
+
+comparison_comm = comm_adata.copy()
+comparison_comm.layers['means'] = np.asarray(comm_adata.layers['means']).copy() * 0.85
+comparison_comm.layers['pvalues'] = np.clip(
+    np.asarray(comm_adata.layers['pvalues']).copy() * 1.1,
+    0.0,
+    1.0,
+)
+
+adata_plot, comm_adata
+
+color_dict = {
+    'CMS1': '#B85C5C',      # dusty pink
+    'CMS2': '#6C8EBF',      # misty blue
+    'CMS3': '#7BAF7B',      # sage green
+    'Mature Enterocytes type 1': '#D4A06A',  # milk-tea brown
+    'Stem-like': '#B39DBC',  # lavender grey
+}
+fig, ax = ov.pl.ccc_network_plot(
+    adata_plot,
+    plot_type='circle',
+    palette=color_dict,
+    title='Aggregated communication strength',
+    figsize=(6, 6),
+    show=False,
+)
+
+# Save as PDF
+fig.savefig('/ZXL/TU2/communication_network.pdf', format='pdf', bbox_inches='tight', dpi=300)
+
+fig, ax = ov.pl.ccc_stat_plot(
+    adata_plot,
+    plot_type='bar',
+    figsize=(6, 4),
+    top_n=10,
+    show=False,
+)
+
+# --------------------------------------------------------------------
+# LIANA
+# --------------------------------------------------------------------
+
+    # Method 2: alternatively
+adata.raw = adata
+    # Make sure .raw.X contains counts
+ov.single.run_liana(
+    adata,
+    groupby='Cell_subtype',
+    method='rank_aggregate',
+    resource_name='consensus',
+    key_added='liana_res',
+    inplace=True,
+)
+
+adata.uns['liana_res'].head()
+
+comm_adata = ov.single.to_comm_adata(
+    adata,
+    result_uns_key='liana_res',
+    score_key='specificity_rank',
+    pvalue_key='specificity_rank',
+    classification_reference='cellchat',
+    classification_fallback='family',
+)
+
+comm_adata
+
+fig, ax = ov.pl.ccc_heatmap(
+    adata,
+    plot_type='dot',
+    display_by='interaction',
+    score_key='specificity_rank',
+    pvalue_key='specificity_rank',
+    classification_reference='cellchat',
+    classification_fallback='family',
+    top_n=6,
+    pvalue_threshold=0.05,
+    color_by='score',
+    ncols=5,
+    figsize=(16, 5),
+    show=False,
+)
+
+# Save as PDF
+fig.savefig('/ZXL/TU2/ccc_heatmap.pdf', format='pdf', bbox_inches='tight', dpi=300)
+
+# Optionally save as PNG for preview
+fig.savefig('/ZXL/TU2/ccc_heatmap.png', format='png', bbox_inches='tight', dpi=300)
+
+fig, ax = ov.pl.ccc_network_plot(
+    adata,
+    plot_type='circle',
+    palette=color_dict,
+    title='Aggregated communication strength',
+    figsize=(6, 6),
+    show=False,
+)
+fig.savefig('/ZXL/TU2/circlep.pdf', format='pdf', bbox_inches='tight', dpi=300)
