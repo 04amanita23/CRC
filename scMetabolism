@@ -1,0 +1,29 @@
+"""
+Script 3: Metabolic pathway activity (scMetabolism)
+Source: code.ipynb (CRC scRNA-seq analysis)
+Note: Jupyter magics are commented out; file names were translated to English.
+"""
+import scanpy as sc
+import omicverse as ov
+import matplotlib.pyplot as plt
+
+ov.plot_set()
+adata = sc.read_h5ad("/ZXL/subtypes/epithelial.h5ad")
+
+
+import omicverse as ov
+
+ov.plot_set()
+
+met = ov.single.Metabolism(adata, method='scmetabolism')
+met.run(score_method='AUCell', metabolism_type='KEGG')
+
+adata.obsm['X_metabolism'].shape
+
+import matplotlib.pyplot as plt
+
+# Draw the figure first
+ov.pl.metabolism_heatmap(adata, groupby='Cell_subtype', n_features=25)
+
+# Save as PDF
+plt.savefig("/ZXL/TU3/metabolism_heatmap.pdf", bbox_inches='tight', dpi=300)
