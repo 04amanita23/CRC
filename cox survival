@@ -1,321 +1,603 @@
 #!/usr/bin/env Rscript
 # =====================================================================
-# Script 5: Immune and stromal infiltration of the six-gene score groups
-#   (a) xCell deconvolution of 67 cell types and group comparison
-#   (b) six-gene x cell-type Spearman correlation heatmap
-#   (c) xCell scores of the cell types that differ between groups
-#   (d) ESTIMATE stromal/immune/ESTIMATE scores and tumour purity
-# Source: six-gene xCell, xCell-correlation and ESTIMATE analyses.
-# Inputs: TCGA-COAD expression matrix; training-set score groups; ESTIMATE
-#         output table. Adjust the paths below to the local directories.
+# Script 6: Cox regression and survival analysis of the six-gene score
+#   (a) univariable Cox screening of the 71 overlapping genes
+#   (b) six-gene Cox score, C-index, time-dependent AUC and Kaplan-Meier
+#       in TCGA-COAD, with adjustment for age and pathological stage
+#   (c) per-gene overall survival by optimal expression cutoff
+#   (d) application of the score in GSE72970 (groups, expression, KM, AUC)
+# Source: cox_venn71.R, six-gene score analysis, optimal-cutoff KM,
+#         GSE72970 risk groups and multivariable Cox model.
+# Inputs: TCGA-COAD expression and survival tables, clinical table,
+#         71-gene list, GSE72970 expression/clinical objects.
 # =====================================================================
 suppressPackageStartupMessages({
-  library(data.table); library(ggplot2); library(pheatmap)
+  library(data.table); library(survival); library(ggplot2); library(timeROC)
 })
 
-BASE         <- "/Users/zhangxiaocheng/Desktop/self"
-EXPR_FILE    <- file.path(BASE, "TCGA_COAD_expression.csv")
-XCELL_DIR    <- file.path(BASE, "six_gene_xCell_20261117")
-CORR_DIR     <- file.path(BASE, "six_gene_xCell_correlation_20261120")
-IMMUNE_DIR   <- file.path(BASE, "six_gene_immune_20261117")
-ESTIMATE_DIR <- file.path(BASE, "five_gene_prognosis_20261112", "07_ESTIMATE_20261113")
+BASE      <- "/Users/zhangxiaocheng/Desktop/self"
+EXPR_FILE <- file.path(BASE, "TCGA_COAD_expression.csv")
+SURV_FILE <- file.path(BASE, "cox_analysis", "06_analysis_samples.csv")
+CLIN_FILE <- file.path(BASE, "cox_analysis", "clinical_COAD_clinicalMatrix.tsv")
 
-## Training-set scores and low/high groups (input table from the risk-score analysis)
-GROUPS_FILE <- file.path(IMMUNE_DIR, "tables",
-                         "04_training_scores_and_groups_optimal_cutoff.csv")
+OUT        <- file.path(BASE, "six_gene_survival_analysis")
+TAB        <- file.path(OUT, "tables")
+FIG        <- file.path(OUT, "figures")
+KM_DIR     <- file.path(OUT, "per_gene_cutoff")
+KM_MEDIAN_DIR <- file.path(BASE, "six_gene_OS_20261119")
+GSE_DIR    <- file.path(OUT, "GSE72970_validation")
+GSE_DATA_DIR <- file.path(BASE, "CRC_OS_colon_20261116", "01_datasets", "GSE72970")
 
-for (d in c(XCELL_DIR, CORR_DIR, IMMUNE_DIR)) {
+for (d in c(OUT, TAB, FIG)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+for (d in c(KM_DIR, GSE_DIR)) {
   dir.create(file.path(d, "tables"),  recursive = TRUE, showWarnings = FALSE)
   dir.create(file.path(d, "figures"), recursive = TRUE, showWarnings = FALSE)
 }
 
 
 # =====================================================================
-# Section 1. xCell deconvolution and comparison between score groups
+# Section 1. Univariable Cox screening of the 71 overlapping genes
 # =====================================================================
-suppressPackageStartupMessages({library(data.table); library(xCell)})
+suppressMessages({library(data.table); library(survival)})
+setwd(BASE)  ## all relative inputs live under BASE
+outdir <- file.path(TAB, "univariable_cox_71"); dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
 
-ROOT <- XCELL_DIR
-GROUPS <- GROUPS_FILE
-EXPR <- EXPR_FILE
+## ---- 1. gene list ----
+g <- fread("venn_genes_71.csv", header = FALSE, col.names = "gene")
+g[, gene := gsub("\"", "", gene)]
+g <- g[toupper(gene) != "SYMBOL" & gene != ""]
+g <- unique(g, by = "gene")
+cat("genes in list:", nrow(g), "\n")
 
-for (d in c("tables", "figures")) dir.create(file.path(ROOT, d), recursive = TRUE, showWarnings = FALSE)
-
-grp <- fread(GROUPS)
-setnames(grp, c("sample", "OS_time", "OS_status", "score", "risk"))
-grp[, group := factor(risk, levels = c("Low", "High"))]
-stopifnot(nrow(grp) == 434, uniqueN(grp$sample) == 434, !anyNA(grp$group))
-
-expr <- fread(EXPR)
+## ---- 2. data ----
+grp  <- fread("TCGA_group_list.csv")
+surv <- fread("TCGA-COAD.survival.tsv.gz")
+expr <- fread("TCGA_COAD_expression.csv", header = TRUE)
 setnames(expr, 1, "gene")
-stopifnot(all(grp$sample %in% names(expr)))
+sv <- as.data.frame(surv); rownames(sv) <- sv$sample
 
-## xCell only uses its own 10,523 signature genes; subset first to keep memory small.
-g <- intersect(expr$gene, xCell.data$genes)
-cat("xCell genes present:", length(g), "\n")
-mat <- as.matrix(expr[match(g, expr$gene), grp$sample, with = FALSE])
-rownames(mat) <- g
-cat("matrix:", nrow(mat), "x", ncol(mat), "\n")
+## ---- 3. samples: tumour only, one primary tumour per patient ----
+tum  <- grp[Group == "Tumor", sample]
+cand <- intersect(tum, sv$sample)
+d <- data.table(sample = cand)
+d[, suffix  := sub("^TCGA-[^-]+-[^-]+-", "", sample)]
+d[, patient := sub("-[^-]+$", "", sample)]
+d <- d[suffix %in% c("01A", "01B", "01C")]
+d[, prio := match(suffix, c("01A", "01B", "01C"))]
+setorder(d, patient, prio, sample)
+d <- d[, .SD[1], by = patient]
+samples <- sort(d$sample)
+time  <- sv[samples, "OS.time"]; event <- sv[samples, "OS"]
+cat("samples:", length(samples), "events:", sum(event), "\n")
 
-set.seed(20261117)
-xc <- xCellAnalysis(mat, rnaseq = TRUE, parallel.sz = 8, parallel.type = "SOCK")
-cat("xCell output:", nrow(xc), "cell types x", ncol(xc), "samples\n")
+## ---- 4. match genes ----
+gl <- unique(g$gene)
+present <- gl[gl %in% expr$gene]
+missing <- setdiff(gl, expr$gene)
+cat("matched in matrix:", length(present), "| missing:", length(missing), paste(missing, collapse = ","), "\n")
 
-saveRDS(xc, file.path(ROOT, "tables", "xcell_scores.rds"))
+sub <- expr[gene %in% present]
+X <- as.matrix(sub[, ..samples]); rownames(X) <- sub$gene
+storage.mode(X) <- "double"
+X <- X[present, , drop = FALSE]
+mean_expr <- rowMeans(X); sd_expr <- apply(X, 1, sd)
 
-d <- merge(grp[, .(sample, score, group)],
-           data.table(sample = colnames(xc), t(xc)), by = "sample")
-setorder(d, sample)
-stopifnot(nrow(d) == 434, uniqueN(d$sample) == 434)
+## ---- 5. univariate Cox ----
+y <- Surv(time, event)
+fit1 <- function(i) {
+  v <- X[i, ]
+  f <- tryCatch(coxph.fit(matrix(v, ncol = 1), y, strata = NULL, offset = NULL, init = NULL,
+                          control = coxph.control(iter.max = 30), weights = NULL,
+                          method = "efron", rownames = NULL), error = function(e) NULL)
+  if (is.null(f) || !is.finite(f$var[1, 1]) || f$var[1, 1] <= 0) return(c(NA, NA))
+  c(f$coefficients[1], sqrt(f$var[1, 1]))
+}
+ab <- t(vapply(seq_along(present), fit1, numeric(2)))
 
-ct <- rownames(xc)
-res <- rbindlist(lapply(ct, function(k) {
-  h <- d[group == "High", get(k)]
-  l <- d[group == "Low", get(k)]
-  w <- suppressWarnings(wilcox.test(h, l))
-  data.table(cell = k,
-             n_low = length(l), n_high = length(h),
-             mean_low = mean(l), mean_high = mean(h),
-             median_low = median(l), median_high = median(h),
-             diff_mean = mean(h) - mean(l),
-             pct_nonzero = mean(d[[k]] > 0),
-             p = w$p.value)
-}))
-res$FDR <- p.adjust(res$p, "BH")
+res <- data.table(gene = present, n = length(samples), n_event = sum(event),
+                  beta = ab[, 1], se = ab[, 2])
+res[, z := beta / se]
+res[, p := 2 * pnorm(-abs(beta / se))]
+res[, HR := exp(beta)]
+res[, HR_lower := exp(beta - 1.959964 * se)]
+res[, HR_upper := exp(beta + 1.959964 * se)]
+res[, HR_per_SD := exp(beta * sd_expr[gene])]
+res[, mean_expr := mean_expr[gene]]
+res[, sd_expr := sd_expr[gene]]
+res[, FDR := p.adjust(p, method = "BH")]
+res[, direction := fifelse(HR > 1, "risk", "protective")]
 setorder(res, p)
-fwrite(res, file.path(ROOT, "tables", "xcell_group_comparison.csv"))
-fwrite(d, file.path(ROOT, "tables", "xcell_scores_with_group.csv"))
 
-cat("n low/high:", sum(d$group == "Low"), sum(d$group == "High"), "\n")
-cat("nominal P<0.05:", sum(res$p < 0.05), " FDR<0.05:", sum(res$FDR < 0.05), "\n")
-print(res[1:min(12, .N), .(cell, mean_low, mean_high, diff_mean, p, FDR)])
-cat("done\n")
+fwrite(res, file.path(outdir, "71_cox_results.csv"))
+fwrite(res[p < 0.05], file.path(outdir, "71_significant_p005.csv"))
+
+cat("\n===== results (sorted by p) =====\n")
+print(res[, .(gene, HR = round(HR, 2), lower = round(HR_lower, 2), upper = round(HR_upper, 2),
+              p = signif(p, 3), FDR = signif(FDR, 3), mean_expr = round(mean_expr, 2))], nrows = 100)
+
+cat("\np<0.05:", nrow(res[p < 0.05]), "of", nrow(res),
+    "| FDR<0.05:", nrow(res[FDR < 0.05]), "| p<0.01:", nrow(res[p < 0.01]), "\n")
+lo <- res[mean_expr < 1]
+cat("low-expression (mean<1):", nrow(lo), "genes\n")
+if (nrow(lo) > 0) print(lo[, .(gene, mean_expr = round(mean_expr, 3), HR = round(HR, 2), p = signif(p, 3))])
+
+## optional: compare with the full 12,642-gene screen if the table is available
+full_file <- "cox_analysis/02_cox_all_genes.csv"
+if (file.exists(full_file)) {
+  full <- fread(full_file)
+  ov <- merge(res[, .(gene, p_71 = p)], full[, .(gene, p_full = p)], by = "gene")
+  cat("\ncorrelation of log p with full 12,642-gene screen:",
+      round(cor(log10(ov$p_71), log10(ov$p_full), use = "complete.obs"), 3), "\n")
+  cat("in 71 list already p<0.05 in full screen:", sum(ov$p_full < 0.05), "of", nrow(ov), "\n")
+}
+
+## ---- 6. optional overlap with an externally supplied gene list ----
+sup_file <- "significant_genes_list(1).csv"
+if (file.exists(sup_file)) {
+  sup <- fread(sup_file, col.names = c("gene", "supplied_p"))
+  cat("\noverlap with supplied 40-gene list:", sum(res$gene %in% sup$gene), "genes:",
+      paste(intersect(res$gene, sup$gene), collapse = ","), "\n")
+  cat("of the", nrow(sup), "supplied genes, significant here:", sum(sup$gene %in% res[p < 0.05]$gene), "\n")
+}
+
+## ---- 7. forest plot ----
+suppressMessages({library(ggplot2)})
+pl <- copy(res)
+pl[, sig := fifelse(p < 0.05, fifelse(HR > 1, "risk (p<0.05)", "protective (p<0.05)"), "not significant")]
+setorder(pl, HR)
+pl[, gene := factor(gene, levels = gene)]
+p1 <- ggplot(pl, aes(x = HR, y = gene, colour = sig)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_errorbarh(aes(xmin = HR_lower, xmax = HR_upper), height = 0.35, linewidth = 0.45) +
+  geom_point(size = 1.9) +
+  scale_x_log10(breaks = c(0.5, 0.7, 1, 1.5, 2, 3)) +
+  scale_colour_manual(values = c("risk (p<0.05)" = "#C0392B", "protective (p<0.05)" = "#2C7FB8",
+                                 "not significant" = "grey55")) +
+  labs(x = "Hazard ratio per unit expression (95% CI, log scale)", y = NULL, colour = NULL,
+       title = "Univariate Cox, 71 VENN genes",
+       subtitle = paste0("TCGA-COAD tumours, n = ", length(samples), ", events = ", sum(event))) +
+  theme_bw(base_size = 9) +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom",
+        plot.title = element_text(face = "bold"))
+ggsave(file.path(outdir, "fig71_forest.pdf"), p1, width = 6.2, height = 9.5)
+ggsave(file.path(outdir, "fig71_forest.png"), p1, width = 6.2, height = 9.5, dpi = 300)
+cat("figure written\n")
+
+
 
 
 # =====================================================================
-# Section 2. Six-gene x cell-type Spearman correlation heatmap
+# Section 2. Six-gene Cox score in TCGA-COAD
+#   coefficients -> linear predictor -> C-index, time-dependent AUC,
+#   Kaplan-Meier by median split -> adjustment for age and stage
 # =====================================================================
-suppressMessages({library(data.table); library(pheatmap)})
+suppressPackageStartupMessages({library(data.table); library(survival); library(timeROC)})
 
-ROOT <- CORR_DIR
-XCELL <- file.path(XCELL_DIR, "tables", "xcell_scores.rds")
-EXPR  <- EXPR_FILE
-OUT   <- file.path(ROOT, "figures", "fig16_six_gene_xCell_correlation_heatmap_compact.pdf")
+expr <- as.data.frame(fread(EXPR_FILE, check.names = FALSE))
+rownames(expr) <- expr[[1]]
+expr <- as.matrix(expr[, -1, drop = FALSE])
+s <- fread(SURV_FILE)
+co <- intersect(s$sample, colnames(expr))
 
+genes6 <- c("FJX1", "TIMP1", "SRMS", "ZBTB12", "KPNA2", "BGN")
+X <- data.frame(t(expr[genes6, co, drop = FALSE]), check.names = FALSE)
+X$OS_time <- s$OS_time[match(co, s$sample)]
+X$OS <- s$OS[match(co, s$sample)]
+X$sample <- co
+
+fit6 <- coxph(Surv(OS_time, OS) ~ FJX1 + TIMP1 + SRMS + ZBTB12 + KPNA2 + BGN, data = X)
+X$score <- as.numeric(predict(fit6, type = "lp"))
+X$score_z <- as.numeric(scale(X$score))
+
+## ---- coefficients, hazard ratios and apparent C-index ----
+sum6 <- summary(fit6)
+coef_tab <- data.table(
+  gene = names(coef(fit6)),
+  coef = as.numeric(coef(fit6)),
+  HR = sum6$coefficients[, "exp(coef)"],
+  lower = sum6$conf.int[, "lower .95"],
+  upper = sum6$conf.int[, "upper .95"],
+  p = sum6$coefficients[, "Pr(>|z|)"]
+)
+coef_tab[, C_index := sum6$concordance[1]]
+fwrite(coef_tab, file.path(TAB, "03_TCGA_six_gene_Cox_coefficients.csv"))
+print(coef_tab)
+
+## ---- time-dependent AUC of the score ----
+roc <- timeROC(T = X$OS_time / 365.25, delta = X$OS, marker = X$score,
+               cause = 1, times = c(1, 3, 5), iid = FALSE)
+cat("time-dependent AUC (1/3/5 years):", paste(round(roc$AUC, 3), collapse = " | "), "\n")
+
+## ---- Kaplan-Meier by median score ----
+X$risk <- factor(ifelse(X$score > median(X$score), "High", "Low"), levels = c("Low", "High"))
+km <- survfit(Surv(OS_time, OS) ~ risk, data = X)
+lr <- survdiff(Surv(OS_time, OS) ~ risk, data = X)
+p_lr <- 1 - pchisq(lr$chisq, df = 1)
+cx <- summary(coxph(Surv(OS_time, OS) ~ risk, data = X))
+
+kdf <- data.table(time = km$time, surv = km$surv, nc = km$n.censor,
+                  risk = rep(sub("^risk=", "", names(km$strata)), km$strata))
+kdf <- rbind(data.table(time = 0, surv = 1, nc = 0, risk = c("Low", "High")), kdf)
+kdf[, risk := factor(risk, levels = c("Low", "High"))]
+kdf[, time_years := time / 365.25]
+
+p_km <- ggplot(kdf, aes(time_years, surv, colour = risk)) +
+  geom_step(linewidth = 0.72) +
+  geom_point(data = kdf[nc > 0 & time > 0], shape = 3, size = 1.05, stroke = 0.4, show.legend = FALSE) +
+  scale_colour_manual(values = c(Low = "#2E86AB", High = "#C0392B"), name = "Six-gene score") +
+  coord_cartesian(xlim = c(0, 12.5), ylim = c(0, 1)) +
+  scale_x_continuous(breaks = seq(0, 12, 3)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.25)) +
+  labs(x = "Time (years)", y = "Overall survival",
+       title = "TCGA-COAD: overall survival by six-gene score",
+       subtitle = sprintf("Median split; n = %d, %d deaths; log-rank P = %.3g; HR = %.2f (%.2f-%.2f)",
+                          nrow(X), sum(X$OS), p_lr, cx$conf.int[1], cx$conf.int[3], cx$conf.int[4])) +
+  theme_bw(base_size = 10) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", size = 11),
+        plot.subtitle = element_text(size = 8.2))
+ggsave(file.path(FIG, "02_TCGA_six_gene_score_KM.pdf"), p_km, width = 6.2, height = 4.6)
+ggsave(file.path(FIG, "02_TCGA_six_gene_score_KM.png"), p_km, width = 6.2, height = 4.6, dpi = 400)
+
+## ---- adjustment for age and pathological stage ----
+clin <- fread(CLIN_FILE)
+clin[, pat12 := substr(sampleID, 1, 12)]
+st <- clin$pathologic_stage
+stage <- ifelse(grepl("IV", st), "IV",
+         ifelse(grepl("III", st), "III",
+         ifelse(grepl("II", st), "II",
+         ifelse(grepl("I", st), "I", NA))))
+cl <- data.table(pat12 = clin$pat12, stage = stage,
+                 age = suppressWarnings(as.numeric(clin$age_at_initial_pathologic_diagnosis)))
+cl <- cl[!is.na(pat12)][!duplicated(pat12)]
+
+X <- as.data.table(X)
+X[, pat12 := substr(sample, 1, 12)]
+d <- merge(X, cl, by = "pat12", all.x = TRUE)
+d[, stage := factor(stage, levels = c("I", "II", "III", "IV"))]
+d[, age10 := age / 10]
+dd <- d[!is.na(stage) & !is.na(age)]
+cat("complete cases:", nrow(dd), "deaths:", sum(dd$OS), "\n")
+
+m_uni  <- coxph(Surv(OS_time, OS) ~ score_z, data = dd)
+m_full <- coxph(Surv(OS_time, OS) ~ score_z + age10 + stage, data = dd)
+
+pull <- function(m, lab) {
+  z <- summary(m)
+  data.table(model = lab, term = rownames(z$coefficients),
+             HR = z$coefficients[, "exp(coef)"],
+             lo = z$conf.int[, "lower .95"], hi = z$conf.int[, "upper .95"],
+             p = z$coefficients[, "Pr(>|z|)"],
+             C_index = unname(z$concordance[1]), n = m$n, events = m$nevent)
+}
+mv <- rbindlist(list(pull(m_uni, "score only"), pull(m_full, "score + age + stage")))
+fwrite(mv, file.path(TAB, "04_multivariable_Cox_six_gene_score.csv"))
+print(mv)
+cat("C-index: score", round(summary(m_uni)$concordance[1], 3),
+    "| score + age + stage", round(summary(m_full)$concordance[1], 3), "\n")
+cat("LRT score vs full: p =",
+    format.pval(anova(m_uni, m_full)$`Pr(>|Chi|)`[2], digits = 3), "\n")
+
+
+# =====================================================================
+# Section 3. Per-gene overall survival by optimal expression cutoff
+# =====================================================================
+# Six genes, per-gene optimal expression cutoff, overall survival in TCGA-COAD training set.
+# Tumour samples only; one primary tumour per patient (n=434, 95 deaths).
+
+root <- KM_DIR
+tabdir <- file.path(root, "tables")
+figdir <- file.path(root, "figures")
+dir.create(tabdir, showWarnings = FALSE, recursive = TRUE)
+dir.create(figdir, showWarnings = FALSE, recursive = TRUE)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(survival)
+  library(survminer)
+  library(maxstat)
+  library(ggplot2)
+})
+
+## ---- data ---------------------------------------------------------------
+expr <- fread(EXPR_FILE)
+setnames(expr, 1, "gene")
+surv <- fread(SURV_FILE)
 genes <- c("FJX1", "TIMP1", "SRMS", "ZBTB12", "KPNA2", "BGN")
-x <- readRDS(XCELL)
-expr <- as.data.frame(fread(EXPR, check.names = FALSE))
-colnames(expr)[1] <- "gene"
-samples <- colnames(x)
-gd <- data.table(sample = samples, t(as.matrix(expr[match(genes, expr$gene), samples])))
-setnames(gd, c("sample", genes))
+samples <- surv$sample
+stopifnot(all(samples %in% names(expr)))
 
-cm <- sapply(rownames(x), function(k) sapply(genes, function(g)
-  cor(gd[[g]], x[k, ], method = "spearman")))
-pm <- sapply(rownames(x), function(k) sapply(genes, function(g)
-  suppressWarnings(cor.test(gd[[g]], x[k, ], method = "spearman")$p.value)))
-fdr <- p.adjust(pm, method = "BH"); dim(fdr) <- dim(pm); dimnames(fdr) <- dimnames(pm)
+emat <- expr[gene %in% genes, c("gene", samples), with = FALSE]
+mat <- as.matrix(emat[, ..samples])
+rownames(mat) <- emat$gene
+stopifnot(all(genes %in% rownames(mat)))
 
-## drop xCell composite scores (kept in the ESTIMATE panel)
-drop <- c("ImmuneScore", "StromaScore", "MicroenvironmentScore")
-cm <- cm[, setdiff(colnames(cm), drop), drop = FALSE]
-pm <- pm[, setdiff(colnames(pm), drop), drop = FALSE]
-fdr <- fdr[, setdiff(colnames(fdr), drop), drop = FALSE]
+d <- data.table(sample = samples, OS_time = surv$OS_time, OS = surv$OS)
+for (g in genes) d[[g]] <- as.numeric(mat[g, samples])
+stopifnot(!anyNA(d[, ..genes]), all(d$OS_time > 0), all(d$OS %in% c(0, 1)))
 
-## keep cell types with max |rho| >= 0.30 across the six genes
-keep <- apply(abs(cm), 2, max) >= 0.30
-cm <- cm[, keep, drop = FALSE]; pm <- pm[, keep, drop = FALSE]; fdr <- fdr[, keep, drop = FALSE]
-ord <- order(apply(abs(cm), 2, max), decreasing = TRUE)
-cm <- cm[, ord, drop = FALSE]; pm <- pm[, ord, drop = FALSE]; fdr <- fdr[, ord, drop = FALSE]
+## ---- per-gene optimal cutoff -------------------------------------------
+## Maximally selected log-rank statistic; each group at least 20% of samples.
+cp <- surv_cutpoint(d, time = "OS_time", event = "OS", variables = genes,
+                    minprop = 0.20, progressbar = FALSE)
+cut_tab <- as.data.table(cp$cutpoint, keep.rownames = "gene")
+setnames(cut_tab, c("gene", "cutoff", "cutpoint_stat"))
 
-xcell_full <- colnames(cm)
-short_map <- c(
-  "aDC"="aDC","Adipocytes"="Adipo","Astrocytes"="Astro","B-cells"="B","Basophils"="Baso",
-  "CD4+ memory T-cells"="CD4 mem","CD4+ naive T-cells"="CD4 naive","CD4+ T-cells"="CD4 T",
-  "CD4+ Tcm"="CD4 Tcm","CD4+ Tem"="CD4 Tem","CD8+ naive T-cells"="CD8 naive","CD8+ T-cells"="CD8 T",
-  "CD8+ Tcm"="CD8 Tcm","CD8+ Tem"="CD8 Tem","cDC"="cDC","Chondrocytes"="Chondro",
-  "Class-switched memory B-cells"="class-sw B","CLP"="CLP","CMP"="CMP","DC"="DC",
-  "Endothelial cells"="Endo","Eosinophils"="Eos","Epithelial cells"="Epi","Erythrocytes"="RBC",
-  "Fibroblasts"="Fibro","GMP"="GMP","Hepatocytes"="Hepato","HSC"="HSC","iDC"="iDC",
-  "Keratinocytes"="Keratino","ly Endothelial cells"="ly Endo","Macrophages"="Mac",
-  "Macrophages M1"="Mac M1","Macrophages M2"="Mac M2","Mast cells"="Mast","Megakaryocytes"="Mega",
-  "Melanocytes"="Melano","Memory B-cells"="mem B","MEP"="MEP","Mesangial cells"="Mesangial",
-  "Monocytes"="Mono","MPP"="MPP","MSC"="MSC","mv Endothelial cells"="mv Endo","Myocytes"="Myocyte",
-  "naive B-cells"="naive B","Neurons"="Neuron","Neutrophils"="Neut","NK cells"="NK","NKT"="NKT",
-  "Osteoblast"="Osteo","pDC"="pDC","Pericytes"="Pericyte","Plasma cells"="Plasma","Platelets"="Platelet",
-  "Preadipocytes"="Preadipo","pro B-cells"="pro B","Sebocytes"="Sebo","Skeletal muscle"="Sk muscle",
-  "Smooth muscle"="Sm muscle","Tgd cells"="gd T","Th1 cells"="Th1","Th2 cells"="Th2","Tregs"="Tregs")
-colnames(cm) <- unname(short_map[colnames(cm)])
-colnames(pm) <- colnames(cm); colnames(fdr) <- colnames(cm)
+## maxstat selection-adjusted p (Lau94), for sensitivity only.
+maxstat_p <- vapply(genes, function(g) {
+  f <- as.formula(paste0("Surv(OS_time, OS) ~ ", g))
+  tryCatch(maxstat.test(f, data = d, smethod = "LogRank",
+                        pmethod = "Lau94", minprop = 0.20)$p.value,
+           error = function(e) NA_real_)
+}, numeric(1))
+maxstat_tab <- data.table(gene = genes, maxstat_p = maxstat_p)
 
-star <- ifelse(fdr < 0.001, "***", ifelse(fdr < 0.01, "**", ifelse(fdr < 0.05, "*", "")))
-disp <- ifelse(abs(cm) >= 0.30, sprintf("%.2f%s", cm, star), "")
-lim <- 0.70; brk <- seq(-lim, lim, length.out = 101)
+## ---- survival statistics -------------------------------------------------
+times <- c(365.25, 1095.75, 1826.25)  # 1, 3, 5 years in days
+res_list <- list()
+km_list <- list()
 
-p <- pheatmap(cm, cluster_rows = FALSE, cluster_cols = FALSE,
-  display_numbers = disp, number_color = "black", fontsize_number = 4.4,
-  color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100), breaks = brk,
-  border_color = "grey92", angle_col = 90,
-  cellwidth = 12.6, cellheight = 19,
-  fontsize = 7, fontsize_col = 5.6, fontsize_row = 7.2,
-  legend = TRUE, silent = TRUE)
+fmt_p <- function(p) sprintf("P = %.4f", p)
 
-pheatmap(cm, cluster_rows = FALSE, cluster_cols = FALSE,
-  display_numbers = disp, number_color = "black", fontsize_number = 4.4,
-  color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100), breaks = brk,
-  border_color = "grey92", angle_col = 90,
-  cellwidth = 12.6, cellheight = 19,
-  fontsize = 7, fontsize_col = 5.6, fontsize_row = 7.2,
-  legend = TRUE, filename = OUT, width = 7.0, height = 2.3)
-cat("columns kept:", ncol(cm), "\n")
-cat("output:", OUT, "\n")
+for (g in genes) {
+  co <- cut_tab[gene == g, cutoff]
+  grp <- factor(ifelse(d[[g]] > co, "High", "Low"), levels = c("Low", "High"))
+  dd <- data.table(time = d$OS_time, event = d$OS, group = grp)
 
+  fit <- survfit(Surv(time, event) ~ group, data = dd)
+  lr <- survdiff(Surv(time, event) ~ group, data = dd)
+  p_lr <- 1 - pchisq(lr$chisq, df = 1)
 
-# =====================================================================
-# Section 3. xCell scores of cell types that differ between groups
-# =====================================================================
-suppressPackageStartupMessages({library(data.table); library(ggplot2)})
+  cox <- coxph(Surv(time, event) ~ group, data = dd)
+  b <- coef(cox)[["groupHigh"]]
+  se <- sqrt(vcov(cox)["groupHigh", "groupHigh"])
+  hr <- exp(b); hr_lo <- exp(b - 1.96 * se); hr_hi <- exp(b + 1.96 * se)
+  p_cox <- summary(cox)$coefficients["groupHigh", "Pr(>|z|)"]
 
-ROOT <- XCELL_DIR
+  tb <- summary(fit)$table
+  med_low <- unname(tb["group=Low", "median"])
+  med_high <- unname(tb["group=High", "median"])
 
-d <- fread(file.path(ROOT, "tables", "xcell_scores_with_group.csv"))
-res <- fread(file.path(ROOT, "tables", "xcell_group_comparison.csv"))
-d[, group := factor(group, levels = c("Low", "High"))]
+  st <- summary(fit, times = times, extend = TRUE)
+  sv <- data.table(group = sub("group=", "", as.character(st$strata)),
+                   time = st$time, surv = st$surv)
+  get_s <- function(grp, tt) sv[group == grp & abs(time - tt) < 1e-6, surv][1]
 
-## 5 cell types passing BH FDR < 0.05, ordered by P.
-sel <- res[FDR < 0.05][order(p), cell]
-cat("selected:", paste(sel, collapse = " | "), "\n")
+  res_list[[g]] <- data.table(
+    gene = g,
+    cutoff = co,
+    n_low = sum(grp == "Low"), n_high = sum(grp == "High"),
+    deaths_low = sum(dd$event[grp == "Low"]),
+    deaths_high = sum(dd$event[grp == "High"]),
+    median_OS_low_days = med_low,
+    median_OS_high_days = med_high,
+    surv_1y_low = get_s("Low", times[1]), surv_1y_high = get_s("High", times[1]),
+    surv_3y_low = get_s("Low", times[2]), surv_3y_high = get_s("High", times[2]),
+    surv_5y_low = get_s("Low", times[3]), surv_5y_high = get_s("High", times[3]),
+    logrank_p = p_lr,
+    HR = hr, HR_low = hr_lo, HR_high = hr_hi, cox_p = p_cox
+  )
 
-long <- melt(d[, c("sample", "group", sel), with = FALSE],
-             id.vars = c("sample", "group"), variable.name = "cell", value.name = "value")
-long[, cell := factor(cell, levels = sel)]
+  sf <- surv_summary(fit, data = dd)
+  sf$gene <- g
+  km_list[[g]] <- as.data.table(sf)[, .(gene, strata, time, surv, n.censor)]
+}
 
-lab <- long[, .(y = max(value, na.rm = TRUE) * 1.04), by = cell]
-lab <- merge(lab, res[, .(cell, p, FDR)], by = "cell", sort = FALSE)
-lab[, txt := paste0("P = ", formatC(p, format = "e", digits = 2),
-                    "\nFDR = ", formatC(FDR, format = "f", digits = 3))]
+res <- rbindlist(res_list)
+res <- merge(res, maxstat_tab, by = "gene", all.x = TRUE)
+res[, FDR := p.adjust(logrank_p, method = "BH")]
+res[, FDR_maxstat := p.adjust(maxstat_p, method = "BH")]
+setorder(res, logrank_p)
 
-g <- ggplot(long, aes(x = group, y = value, fill = group)) +
-  geom_boxplot(width = 0.62, outlier.size = 0.18, linewidth = 0.28) +
-  geom_text(data = lab, aes(x = 1.5, y = y, label = txt),
-            inherit.aes = FALSE, hjust = 0.5, vjust = 0,
-            size = 3.45, lineheight = 1.0) +
-  facet_wrap(~ cell, scales = "free_y", nrow = 1, labeller = label_wrap_gen(width = 16)) +
-  scale_fill_manual(values = c(Low = "#3B6FB6", High = "#C0392B"),
-                    labels = c(Low = "Low (n=350)", High = "High (n=84)"), name = NULL) +
-  scale_y_continuous(expand = expansion(mult = c(0.02, 0.28))) +
-  labs(title = "xCell enrichment scores by six-gene score group",
-       subtitle = "5 of 67 cell types with BH FDR < 0.05; Wilcoxon High vs Low, TCGA-COAD n=434",
-       x = NULL, y = "xCell enrichment score") +
-  theme_bw(base_size = 11.0) +
-  theme(panel.grid.major.x = element_blank(),
+## ---- KM data ------------------------------------------------------------
+km <- rbindlist(km_list, use.names = TRUE, fill = TRUE)
+km[, group := sub("group=", "", as.character(strata))]
+km <- km[, .(gene, group, time, surv, n.censor)]
+zero <- km[, .(time = 0, surv = 1, n.censor = 0), by = .(gene, group)]
+km <- rbind(zero, km, fill = TRUE)
+km[, `:=`(gene = factor(gene, levels = genes),
+          group = factor(group, levels = c("Low", "High")))]
+setorder(km, gene, group, time)
+km[, time_years := time / 365.25]
+cens <- km[n.censor > 0 & time > 0]
+
+ann <- res[, .(gene,
+               stat = paste0("log-rank ", fmt_p(logrank_p),
+                             "\nHR ", sprintf("%.2f", HR),
+                             " (", sprintf("%.2f", HR_low), "\u2013",
+                             sprintf("%.2f", HR_high), ")"),
+               cutlab = sprintf("cutoff %.2f\nLow %d / High %d", cutoff, n_low, n_high))]
+ann[, gene := factor(gene, levels = genes)]
+
+## ---- figure -------------------------------------------------------------
+p <- ggplot(km, aes(x = time_years, y = surv, colour = group)) +
+  geom_step(linewidth = 0.72) +
+  geom_point(data = cens, aes(x = time_years, y = surv, colour = group),
+             shape = 3, size = 1.25, stroke = 0.45, show.legend = FALSE) +
+  geom_text(data = ann, aes(x = 12.35, y = 0.055, label = stat),
+            inherit.aes = FALSE, hjust = 1, vjust = 0,
+            size = 2.85, lineheight = 1.0, family = "Arial") +
+  geom_text(data = ann, aes(x = 0.3, y = 0.105, label = cutlab),
+            inherit.aes = FALSE, hjust = 0, vjust = 0,
+            size = 2.55, lineheight = 0.95, family = "Arial", colour = "grey35") +
+  facet_wrap(~ gene, nrow = 2) +
+  scale_colour_manual(values = c(Low = "#2E86AB", High = "#C0392B"),
+                      labels = c("Low (\u2264 cutoff)", "High (> cutoff)"),
+                      name = "Expression") +
+  scale_x_continuous(breaks = seq(0, 12, 3)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.25)) +
+  coord_cartesian(xlim = c(0, 12.5), ylim = c(0, 1)) +
+  labs(title = "Six genes: overall survival by optimal expression cutoff",
+       subtitle = "TCGA-COAD training set, 434 tumours / 95 deaths; per-gene optimal cutoff (maximally selected log-rank, minprop 0.20); HR = high vs low",
+       x = "Time (years)", y = "Overall survival") +
+  theme_bw(base_size = 10.5, base_family = "Arial") +
+  theme(panel.grid.major = element_blank(),
         panel.grid.minor = element_blank(),
         strip.background = element_rect(fill = "grey92", colour = "grey60", linewidth = 0.3),
-        strip.text = element_text(face = "bold", size = 10.0),
-        axis.text.x = element_text(size = 10.0),
-        axis.text.y = element_text(size = 9.8),
+        strip.text = element_text(face = "bold", size = 10.2),
+        axis.text = element_text(size = 9.4),
+        axis.title = element_text(size = 10),
         legend.position = "top",
-        legend.direction = "horizontal",
-        legend.key.size = unit(0.45, "cm"),
-        plot.title = element_text(size = 13.5, face = "bold"),
-        plot.subtitle = element_text(size = 10.0),
-        plot.margin = margin(6, 8, 4, 6))
+        legend.title = element_text(size = 10),
+        legend.text = element_text(size = 9.2),
+        plot.title = element_text(size = 13, face = "bold"),
+        plot.subtitle = element_text(size = 8.7),
+        plot.margin = margin(8, 10, 6, 8))
 
-ggsave(file.path(ROOT, "figures", "01_xCell_significant_cells_by_group.png"),
-       g, width = 8.0, height = 4.5, dpi = 300)
-quartz(type = "pdf",
-       file = file.path(ROOT, "figures", "01_xCell_significant_cells_by_group.pdf"),
-       width = 8.0, height = 4.5)
-print(g); dev.off()
+quartz(type = "pdf", file = file.path(figdir, "01_six_gene_optimal_cutoff_KM.pdf"),
+       width = 12, height = 7.4, family = "Arial")
+print(p); dev.off()
 
-fwrite(res[FDR < 0.05], file.path(ROOT, "tables", "xcell_significant_fdr005.csv"))
-cat("done\n")
+png(file.path(figdir, "01_six_gene_optimal_cutoff_KM.png"),
+    width = 12, height = 7.4, res = 400, units = "in", family = "Arial")
+print(p); dev.off()
+
+## ---- tables -------------------------------------------------------------
+# Per-sample expression and group assignment
+out_d <- copy(d)
+for (g in genes) {
+  co <- cut_tab[gene == g, cutoff]
+  set(out_d, j = paste0("group_", g), value = ifelse(d[[g]] > co, "High", "Low"))
+}
+fwrite(out_d, file.path(tabdir, "01_six_gene_expression_and_cutoff_groups.csv"))
+fwrite(res, file.path(tabdir, "02_six_gene_optimal_cutoff_survival_stats.csv"))
+
+# Median-split comparison, from the earlier analysis
+med_file <- file.path(KM_MEDIAN_DIR, "tables", "02_six_gene_median_group_survival_stats.csv")
+if (file.exists(med_file)) {
+  med <- fread(med_file)[, .(gene, median_logrank_p = logrank_p, median_FDR = FDR)]
+  cmp <- merge(res[, .(gene, cutoff, n_low, n_high, HR, HR_low, HR_high,
+                       logrank_p, FDR, maxstat_p, FDR_maxstat)],
+               med, by = "gene", all.x = TRUE)
+  setorder(cmp, logrank_p)
+  fwrite(cmp, file.path(tabdir, "03_median_vs_optimal_cutoff.csv"))
+}
+
+cat("Genes:", paste(genes, collapse = ", "), "\n")
+cat("Samples:", nrow(d), "deaths:", sum(d$OS), "\n")
+print(res[, .(gene, cutoff, n_low, n_high, deaths_low, deaths_high,
+              logrank_p, FDR, HR, HR_low, HR_high, maxstat_p)])
+cat("saved:", file.path(figdir, "01_six_gene_optimal_cutoff_KM.pdf"), "\n")
+
 
 
 # =====================================================================
-# Section 4. ESTIMATE scores and tumour purity
+# Section 4. Application of the six-gene Cox score in GSE72970
+#   the TCGA-trained coefficients are applied unchanged, samples are
+#   split at the median score, and survival and discrimination are
+#   evaluated in the external cohort
 # =====================================================================
-suppressMessages({library(data.table); library(ggplot2)})
+suppressPackageStartupMessages({library(data.table); library(survival); library(ggplot2); library(timeROC)})
 
-OUT <- IMMUNE_DIR
-SRC <- ESTIMATE_DIR
+## 1. Fixed TCGA-trained coefficients (from Section 2).
+b <- setNames(coef_tab$coef, coef_tab$gene)
+genes <- names(b)
 
-## ESTIMATE scores were computed on the same 434 tumours with the GSVA/estimate pipeline.
-est <- fread(file.path(SRC, "tables", "41_ESTIMATE_scores.csv"))
-expr <- as.data.frame(fread(EXPR_FILE))
-colnames(expr)[1] <- "gene"
+## 2. Apply the score to GSE72970 colon tumours.
+e <- readRDS(file.path(GSE_DATA_DIR, "expr.rds"))
+c <- readRDS(file.path(GSE_DATA_DIR, "clinical.rds"))
+stopifnot(identical(colnames(e), c$sample), all(genes %in% rownames(e)))
 
-b6 <- c(FJX1 = 0.29497912, TIMP1 = 0.25555369, SRMS = 0.17331479,
-        ZBTB12 = 0.29670142, KPNA2 = -0.22294035, BGN = -0.03381982)
-stopifnot(all(names(b6) %in% expr$gene),
-          all(est$sample %in% names(expr)),
-          !anyDuplicated(expr$gene))
+score <- as.numeric(t(e[genes, , drop = FALSE]) %*% b)
+group <- ifelse(score > median(score), "High", "Low")
+risk_tab <- data.frame(sample = c$sample, risk_score = score, risk_group = group,
+                       OS_time = c$OS_time, OS_status = c$OS_status,
+                       t(e[genes, , drop = FALSE]), check.names = FALSE)
+fwrite(risk_tab, file.path(GSE_DIR, "tables", "01_GSE72970_six_gene_risk_scores.csv"))
 
-X6 <- t(as.matrix(expr[match(names(b6), expr$gene), est$sample]))
-colnames(X6) <- names(b6)
-est[, score6 := as.numeric(X6 %*% b6)]
-est[, group6 := factor(ifelse(score6 > median(score6), "High", "Low"),
-                       levels = c("Low", "High"))]
-stopifnot(nrow(est) == 434, sum(est$group6 == "Low") == 217, sum(est$group6 == "High") == 217)
-
-## add BGN to the per-sample expression columns
-est <- merge(est, data.table(sample = est$sample, BGN = as.numeric(expr[match("BGN", expr$gene), est$sample])),
-             by = "sample")
-setorder(est, sample)
-
-met <- c("StromalScore", "ImmuneScore", "ESTIMATEScore", "TumorPurity")
-cmp <- rbindlist(lapply(met, function(m) {
-  lo <- est[group6 == "Low"][[m]]
-  hi <- est[group6 == "High"][[m]]
-  data.table(metric = m,
+## 3. Gene expression differences between risk groups.
+st <- do.call(rbind, lapply(genes, function(g) {
+  lo <- e[g, group == "Low"]; hi <- e[g, group == "High"]
+  data.frame(gene = g, n_low = length(lo), n_high = length(hi),
              mean_low = mean(lo), mean_high = mean(hi),
-             diff_mean = mean(hi) - mean(lo),
-             p = wilcox.test(hi, lo)$p.value)
+             median_low = median(lo), median_high = median(hi),
+             diff_high_minus_low = mean(hi) - mean(lo),
+             wilcox_p = wilcox.test(hi, lo)$p.value,
+             t_p = t.test(hi, lo)$p.value)
 }))
-cmp[, FDR := p.adjust(p, "BH")]
+st$FDR <- p.adjust(st$wilcox_p, method = "BH")
+fwrite(st, file.path(GSE_DIR, "tables", "02_GSE72970_risk_group_six_gene_expression_stats.csv"))
 
-fwrite(est[, .(sample, score6, group6, StromalScore, ImmuneScore, ESTIMATEScore, TumorPurity,
-               FJX1, TIMP1, SRMS, ZBTB12, KPNA2, BGN)],
-       file.path(OUT, "tables", "04_six_gene_ESTIMATE_scores.csv"))
-fwrite(cmp, file.path(OUT, "tables", "05_six_gene_ESTIMATE_group_comparison.csv"))
-
-lab <- c(StromalScore = "Stromal score", ImmuneScore = "Immune score",
-         ESTIMATEScore = "ESTIMATE score", TumorPurity = "Tumour purity")
-met_plot <- c("StromalScore", "ImmuneScore", "ESTIMATEScore")
-
-pl <- rbindlist(lapply(met_plot, function(m) {
-  data.table(metric = factor(lab[m], levels = lab),
-             value = est[[m]], group = est$group6)
+## 4. Expression boxplots in the two risk groups.
+long <- do.call(rbind, lapply(genes, function(g) data.frame(
+  gene = g, group = factor(group, levels = c("Low", "High")), value = as.numeric(e[g, ])
+)))
+long$gene <- factor(long$gene, levels = genes)
+ann <- do.call(rbind, lapply(genes, function(g) {
+  v <- long$value[long$gene == g]
+  data.frame(gene = factor(g, levels = genes), x = 1.5,
+             y = max(v) + 0.09 * diff(range(v)),
+             lab = sprintf("P = %.2g", st$wilcox_p[match(g, st$gene)]))
 }))
-pl[, group := factor(group, levels = c("Low", "High"))]
-
-ymax <- pl[, .(y = max(value) * 0.96), by = metric]
-ann <- merge(cmp[metric %in% met_plot, .(metric = factor(lab[metric], levels = lab), p = p)],
-             ymax, by = "metric")
-
-p18 <- ggplot(pl, aes(group, value, fill = group)) +
-  geom_boxplot(width = 0.55, outlier.size = 0.35, linewidth = 0.35) +
-  facet_wrap(~metric, scales = "free_y", nrow = 1) +
-  scale_fill_manual(values = c(Low = "#3B6FB6", High = "#C0392B")) +
-  labs(x = NULL, y = NULL) +
+p <- ggplot(long, aes(x = group, y = value, fill = group)) +
+  geom_boxplot(outlier.shape = NA, linewidth = 0.3, width = 0.58) +
+  geom_jitter(width = 0.14, size = 0.35, alpha = 0.35, color = "grey25") +
+  geom_text(data = ann, aes(x = x, y = y, label = lab), inherit.aes = FALSE, size = 2.7) +
+  facet_wrap(~ gene, nrow = 2, scales = "free_y") +
+  scale_fill_manual(values = c(Low = "#4C78A8", High = "#C1663F")) +
+  labs(x = NULL, y = "log2 expression", fill = NULL,
+       title = "GSE72970: six-gene expression by risk group",
+       subtitle = sprintf("Median split of the TCGA-trained six-gene Cox score; %d low / %d high; Wilcoxon P",
+                          sum(group == "Low"), sum(group == "High"))) +
   theme_bw(base_size = 9) +
-  theme(legend.position = "none",
-        panel.grid.minor = element_blank(),
-        strip.background = element_rect(fill = "grey92", colour = NA),
-        strip.text = element_text(size = 8.5)) +
-  geom_text(data = ann, aes(x = 1.5, y = y, label = sprintf("P = %.2g", p)),
-            inherit.aes = FALSE, size = 2.8, vjust = 1)
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold", size = 8),
+        plot.title = element_text(face = "bold", size = 10),
+        plot.subtitle = element_text(size = 7.8),
+        panel.grid.minor = element_blank())
+ggsave(file.path(GSE_DIR, "figures", "01_GSE72970_risk_group_six_gene_expression.pdf"),
+       p, width = 8.2, height = 6.2)
+ggsave(file.path(GSE_DIR, "figures", "01_GSE72970_risk_group_six_gene_expression.png"),
+       p, width = 8.2, height = 6.2, dpi = 400)
 
-ggsave(file.path(OUT, "figures", "fig18_six_gene_ESTIMATE_by_group.png"),
-       p18, width = 6.6, height = 2.9, dpi = 300)
+## 5. Kaplan-Meier and time-dependent AUC of the fixed score.
+gdf <- data.table(OS_years = c$OS_time / 365.25, OS = c$OS_status,
+                  risk = factor(group, levels = c("Low", "High")))
+km <- survfit(Surv(OS_years, OS) ~ risk, data = gdf)
+lr <- survdiff(Surv(OS_years, OS) ~ risk, data = gdf)
+p_lr <- 1 - pchisq(lr$chisq, df = 1)
+cx <- summary(coxph(Surv(OS_years, OS) ~ risk, data = gdf))
+cat("GSE72970 log-rank P =", format.pval(p_lr, digits = 3),
+    " HR (high vs low) =", round(cx$conf.int[1], 2),
+    "(", round(cx$conf.int[3], 2), "-", round(cx$conf.int[4], 2), ")\n")
 
-quartz(type = "pdf",
-       file = file.path(OUT, "figures", "fig18_six_gene_ESTIMATE_by_group.pdf"),
-       width = 6.6, height = 2.9)
-print(p18)
-dev.off()
+gd <- timeROC(T = gdf$OS_years, delta = gdf$OS, marker = risk_tab$risk_score,
+              cause = 1, times = c(3, 5), iid = FALSE)
+cat("GSE72970 time-dependent AUC (3/5 years):",
+    paste(round(gd$AUC, 3), collapse = " | "), "\n")
 
-cat("n:", nrow(est), " low:", sum(est$group6 == "Low"), " high:", sum(est$group6 == "High"), "\n")
-cat("median score:", median(est$score6), " range:", paste(round(range(est$score6), 3), collapse = " to "), "\n")
-print(cmp)
-cat("done\n")
+kdf <- data.table(time = km$time, surv = km$surv, nc = km$n.censor,
+                  risk = rep(sub("^risk=", "", names(km$strata)), km$strata))
+kdf <- rbind(data.table(time = 0, surv = 1, nc = 0, risk = c("Low", "High")), kdf)
+kdf[, risk := factor(risk, levels = c("Low", "High"))]
+
+p_km <- ggplot(kdf, aes(time, surv, colour = risk)) +
+  geom_step(linewidth = 0.8) +
+  geom_point(data = kdf[nc > 0], shape = 3, size = 1.1, stroke = 0.4, show.legend = FALSE) +
+  scale_colour_manual(values = c(Low = "#2E86AB", High = "#C0392B"), name = "Six-gene score") +
+  coord_cartesian(xlim = c(0, 6.5), ylim = c(0, 1)) +
+  scale_x_continuous(breaks = seq(0, 6, 2)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.25)) +
+  labs(x = "Years", y = "Overall survival",
+       title = "GSE72970: overall survival by six-gene score",
+       subtitle = sprintf("n = %d, %d deaths; log-rank P = %.3g; HR = %.2f (%.2f-%.2f); 3/5-year AUC %.2f/%.2f",
+                          nrow(gdf), sum(gdf$OS), p_lr,
+                          cx$conf.int[1], cx$conf.int[3], cx$conf.int[4],
+                          gd$AUC[1], gd$AUC[2])) +
+  theme_bw(base_size = 10) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", size = 11),
+        plot.subtitle = element_text(size = 8.0))
+ggsave(file.path(GSE_DIR, "figures", "02_GSE72970_KM_six_gene_score.pdf"),
+       p_km, width = 6.2, height = 4.6)
+ggsave(file.path(GSE_DIR, "figures", "02_GSE72970_KM_six_gene_score.png"),
+       p_km, width = 6.2, height = 4.6, dpi = 400)
+
+fwrite(data.table(endpoint = "OS", n = nrow(gdf), events = sum(gdf$OS),
+                  logrank_p = p_lr, hr = cx$conf.int[1], hr_low = cx$conf.int[3],
+                  hr_high = cx$conf.int[4], auc_3y = gd$AUC[1], auc_5y = gd$AUC[2]),
+       file.path(GSE_DIR, "tables", "03_GSE72970_KM_AUC_summary.csv"))
+
+cat("groups\n"); print(table(group))
+cat("stats\n"); print(st)
+
