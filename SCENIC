@@ -1,0 +1,158 @@
+"""
+Script 4: Transcription-factor activity (SCENIC and scRegulate)
+Source: code.ipynb (CRC scRNA-seq analysis)
+Note: Jupyter magics are commented out; file names were translated to English.
+"""
+import scanpy as sc
+import numpy as np
+import pandas as pd
+import omicverse as ov
+
+ov.plot_set()
+adata = sc.read_h5ad("/ZXL/subtypes/epithelial.h5ad")
+
+
+# --------------------------------------------------------------------
+# SCENIC
+# --------------------------------------------------------------------
+
+# Initialize the SCENIC object
+scenic_obj = ov.single.SCENIC(
+    adata=adata,      # Single-cell expression data
+    species="hg38",   # Automatically prepare mouse mm10 cisTarget resources
+    n_jobs=8,         # Number of parallel workers
+)
+
+edgelist = scenic_obj.cal_grn(layer='scaled') 
+
+# --------------------------------------------------------------------
+# scRegulate
+# --------------------------------------------------------------------
+
+import scanpy as sc
+import numpy as np
+import pandas as pd
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+import omicverse as ov
+ov.plot_set(font_path='Arial')
+
+# %load_ext autoreload
+# %autoreload 2
+
+# !pip install optuna
+# !pip install scregulate
+
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import matplotlib.pyplot as plt
+import scregulate as reg
+import os
+import sys
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import anndata as ad
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import seaborn as sns
+import omicverse as ov
+import pickle
+ov.plot_set()
+
+import warnings
+warnings.simplefilter("ignore")
+
+import scanpy as sc
+adata=sc.read_h5ad("/ZXL/subtypes/epithelial.h5ad")
+
+rna_data_all=adata
+print("AnnData summary:")
+print(rna_data_all)
+
+# If .X contains raw counts (integers)
+raw_X = rna_data_all.X.copy()
+obs = rna_data_all.obs.copy()
+var = rna_data_all.var.copy()
+
+# Or if .X is normalized but raw counts are stored in layers
+if 'counts' in rna_data_all.layers:
+    raw_X = rna_data_all.layers['counts'].copy()
+elif 'raw_counts' in rna_data_all.layers:
+    raw_X = rna_data_all.layers['raw_counts'].copy()
+elif 'raw' in rna_data_all.layers:
+    raw_X = rna_data_all.layers['raw'].copy()
+else:
+    print("WARNING: raw count layer not found; check the data source")
+
+import pandas as pd
+net = pd.read_csv('/ZXL/new/crc_scrna_st_project/collectri_human_net.csv')
+print(net.head())
+print("Network `collectri_human_net` loaded with shape:", net.shape)
+
+model, processed_adata, GRN = reg.train_model( 
+ rna_data=rna_data_all, net=net,
+ encode_dims=[2048, 256, 64], decode_dims=[256], z_dim=40,
+train_val_split_ratio=0.85,
+ epochs=10000,
+ freeze_epochs=4500,
+ learning_rate=1e-4,
+ alpha_max=1,
+ alpha_scale=0.0025,
+ early_stopping_patience=4500,
+ min_targets=10
+)
+
+processed_adata, fine_tuned_tf_activities, fine_model, GRN = reg.fine_tuning.fine_tune_clusters(
+ model=model, processed_adata=processed_adata, epochs=2000
+)
+# Inspect the expression of several transcription factors
+
+sc.pl.violin(fine_tuned_tf_activities, keys=['BARX2','KLF6',"HNF1A","SOX17","HES1","CREM"], rotation=90, groupby='Cell_subtype', jitter=False,save="key-TF.pdf")
+
+top_DA_TFs = fine_tuned_tf_activities.uns['rank_genes_groups']['names'][:30]
+top_DA_TFs = pd.DataFrame.from_records(top_DA_TFs, columns=top_DA_TFs.dtype.names)
+top_DA_TFs.to_csv('/ZXL/TU3/top_TFs_pre.csv', index=False)
+
+top_DA_TFs = pd.DataFrame(top_DA_TFs)
+
+# Take the top 5 transcription factors per cell type and combine them
+top_5_per_cell = []
+cell_types = []
+
+for col in top_DA_TFs.columns:
+# Take the top 5
+ top_5_tfs = top_DA_TFs[col].head(5).tolist()
+ top_5_per_cell.extend(top_5_tfs)
+ 
+ # Record the cell type for downstream use
+ cell_types.extend([col] * len(top_5_tfs))
+
+# Create the result data frame
+result_df = pd.DataFrame({
+ 'cell_type': cell_types,
+'top_DA_TF': top_5_per_cell,
+ 'rank': [i%5+1 for i in range(len(top_5_per_cell))]
+})
+
+print("Top 5 transcription factors per cell type:")
+print(result_df)
+
+# If only the TF list is needed (without duplicates)
+unique_tfs = pd.Series(top_5_per_cell).drop_duplicates().reset_index(drop=True)
+unique_tfs_df = pd.DataFrame({'top_DA_TF': unique_tfs})
+
+sc.pl.matrixplot(
+ fine_tuned_tf_activities,
+  var_names=unique_tfs_df['top_DA_TF'].tolist(), # Use the top 10 DA TFs
+ groupby='Cell_subtype', 
+ #dendrogram=True,           # Show dendrogram for clustering
+  standard_scale='var', 
+  cmap='RdBu_r', 
+  colorbar_title='Z-scaled scores', 
+  swap_axes=True,
+  figsize=(5, 8),
+  save='TF_activity_heatmap.pdf'
+)
