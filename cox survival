@@ -1,0 +1,321 @@
+#!/usr/bin/env Rscript
+# =====================================================================
+# Script 5: Immune and stromal infiltration of the six-gene score groups
+#   (a) xCell deconvolution of 67 cell types and group comparison
+#   (b) six-gene x cell-type Spearman correlation heatmap
+#   (c) xCell scores of the cell types that differ between groups
+#   (d) ESTIMATE stromal/immune/ESTIMATE scores and tumour purity
+# Source: six-gene xCell, xCell-correlation and ESTIMATE analyses.
+# Inputs: TCGA-COAD expression matrix; training-set score groups; ESTIMATE
+#         output table. Adjust the paths below to the local directories.
+# =====================================================================
+suppressPackageStartupMessages({
+  library(data.table); library(ggplot2); library(pheatmap)
+})
+
+BASE         <- "/Users/zhangxiaocheng/Desktop/self"
+EXPR_FILE    <- file.path(BASE, "TCGA_COAD_expression.csv")
+XCELL_DIR    <- file.path(BASE, "six_gene_xCell_20261117")
+CORR_DIR     <- file.path(BASE, "six_gene_xCell_correlation_20261120")
+IMMUNE_DIR   <- file.path(BASE, "six_gene_immune_20261117")
+ESTIMATE_DIR <- file.path(BASE, "five_gene_prognosis_20261112", "07_ESTIMATE_20261113")
+
+## Training-set scores and low/high groups (input table from the risk-score analysis)
+GROUPS_FILE <- file.path(IMMUNE_DIR, "tables",
+                         "04_training_scores_and_groups_optimal_cutoff.csv")
+
+for (d in c(XCELL_DIR, CORR_DIR, IMMUNE_DIR)) {
+  dir.create(file.path(d, "tables"),  recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(d, "figures"), recursive = TRUE, showWarnings = FALSE)
+}
+
+
+# =====================================================================
+# Section 1. xCell deconvolution and comparison between score groups
+# =====================================================================
+suppressPackageStartupMessages({library(data.table); library(xCell)})
+
+ROOT <- XCELL_DIR
+GROUPS <- GROUPS_FILE
+EXPR <- EXPR_FILE
+
+for (d in c("tables", "figures")) dir.create(file.path(ROOT, d), recursive = TRUE, showWarnings = FALSE)
+
+grp <- fread(GROUPS)
+setnames(grp, c("sample", "OS_time", "OS_status", "score", "risk"))
+grp[, group := factor(risk, levels = c("Low", "High"))]
+stopifnot(nrow(grp) == 434, uniqueN(grp$sample) == 434, !anyNA(grp$group))
+
+expr <- fread(EXPR)
+setnames(expr, 1, "gene")
+stopifnot(all(grp$sample %in% names(expr)))
+
+## xCell only uses its own 10,523 signature genes; subset first to keep memory small.
+g <- intersect(expr$gene, xCell.data$genes)
+cat("xCell genes present:", length(g), "\n")
+mat <- as.matrix(expr[match(g, expr$gene), grp$sample, with = FALSE])
+rownames(mat) <- g
+cat("matrix:", nrow(mat), "x", ncol(mat), "\n")
+
+set.seed(20261117)
+xc <- xCellAnalysis(mat, rnaseq = TRUE, parallel.sz = 8, parallel.type = "SOCK")
+cat("xCell output:", nrow(xc), "cell types x", ncol(xc), "samples\n")
+
+saveRDS(xc, file.path(ROOT, "tables", "xcell_scores.rds"))
+
+d <- merge(grp[, .(sample, score, group)],
+           data.table(sample = colnames(xc), t(xc)), by = "sample")
+setorder(d, sample)
+stopifnot(nrow(d) == 434, uniqueN(d$sample) == 434)
+
+ct <- rownames(xc)
+res <- rbindlist(lapply(ct, function(k) {
+  h <- d[group == "High", get(k)]
+  l <- d[group == "Low", get(k)]
+  w <- suppressWarnings(wilcox.test(h, l))
+  data.table(cell = k,
+             n_low = length(l), n_high = length(h),
+             mean_low = mean(l), mean_high = mean(h),
+             median_low = median(l), median_high = median(h),
+             diff_mean = mean(h) - mean(l),
+             pct_nonzero = mean(d[[k]] > 0),
+             p = w$p.value)
+}))
+res$FDR <- p.adjust(res$p, "BH")
+setorder(res, p)
+fwrite(res, file.path(ROOT, "tables", "xcell_group_comparison.csv"))
+fwrite(d, file.path(ROOT, "tables", "xcell_scores_with_group.csv"))
+
+cat("n low/high:", sum(d$group == "Low"), sum(d$group == "High"), "\n")
+cat("nominal P<0.05:", sum(res$p < 0.05), " FDR<0.05:", sum(res$FDR < 0.05), "\n")
+print(res[1:min(12, .N), .(cell, mean_low, mean_high, diff_mean, p, FDR)])
+cat("done\n")
+
+
+# =====================================================================
+# Section 2. Six-gene x cell-type Spearman correlation heatmap
+# =====================================================================
+suppressMessages({library(data.table); library(pheatmap)})
+
+ROOT <- CORR_DIR
+XCELL <- file.path(XCELL_DIR, "tables", "xcell_scores.rds")
+EXPR  <- EXPR_FILE
+OUT   <- file.path(ROOT, "figures", "fig16_six_gene_xCell_correlation_heatmap_compact.pdf")
+
+genes <- c("FJX1", "TIMP1", "SRMS", "ZBTB12", "KPNA2", "BGN")
+x <- readRDS(XCELL)
+expr <- as.data.frame(fread(EXPR, check.names = FALSE))
+colnames(expr)[1] <- "gene"
+samples <- colnames(x)
+gd <- data.table(sample = samples, t(as.matrix(expr[match(genes, expr$gene), samples])))
+setnames(gd, c("sample", genes))
+
+cm <- sapply(rownames(x), function(k) sapply(genes, function(g)
+  cor(gd[[g]], x[k, ], method = "spearman")))
+pm <- sapply(rownames(x), function(k) sapply(genes, function(g)
+  suppressWarnings(cor.test(gd[[g]], x[k, ], method = "spearman")$p.value)))
+fdr <- p.adjust(pm, method = "BH"); dim(fdr) <- dim(pm); dimnames(fdr) <- dimnames(pm)
+
+## drop xCell composite scores (kept in the ESTIMATE panel)
+drop <- c("ImmuneScore", "StromaScore", "MicroenvironmentScore")
+cm <- cm[, setdiff(colnames(cm), drop), drop = FALSE]
+pm <- pm[, setdiff(colnames(pm), drop), drop = FALSE]
+fdr <- fdr[, setdiff(colnames(fdr), drop), drop = FALSE]
+
+## keep cell types with max |rho| >= 0.30 across the six genes
+keep <- apply(abs(cm), 2, max) >= 0.30
+cm <- cm[, keep, drop = FALSE]; pm <- pm[, keep, drop = FALSE]; fdr <- fdr[, keep, drop = FALSE]
+ord <- order(apply(abs(cm), 2, max), decreasing = TRUE)
+cm <- cm[, ord, drop = FALSE]; pm <- pm[, ord, drop = FALSE]; fdr <- fdr[, ord, drop = FALSE]
+
+xcell_full <- colnames(cm)
+short_map <- c(
+  "aDC"="aDC","Adipocytes"="Adipo","Astrocytes"="Astro","B-cells"="B","Basophils"="Baso",
+  "CD4+ memory T-cells"="CD4 mem","CD4+ naive T-cells"="CD4 naive","CD4+ T-cells"="CD4 T",
+  "CD4+ Tcm"="CD4 Tcm","CD4+ Tem"="CD4 Tem","CD8+ naive T-cells"="CD8 naive","CD8+ T-cells"="CD8 T",
+  "CD8+ Tcm"="CD8 Tcm","CD8+ Tem"="CD8 Tem","cDC"="cDC","Chondrocytes"="Chondro",
+  "Class-switched memory B-cells"="class-sw B","CLP"="CLP","CMP"="CMP","DC"="DC",
+  "Endothelial cells"="Endo","Eosinophils"="Eos","Epithelial cells"="Epi","Erythrocytes"="RBC",
+  "Fibroblasts"="Fibro","GMP"="GMP","Hepatocytes"="Hepato","HSC"="HSC","iDC"="iDC",
+  "Keratinocytes"="Keratino","ly Endothelial cells"="ly Endo","Macrophages"="Mac",
+  "Macrophages M1"="Mac M1","Macrophages M2"="Mac M2","Mast cells"="Mast","Megakaryocytes"="Mega",
+  "Melanocytes"="Melano","Memory B-cells"="mem B","MEP"="MEP","Mesangial cells"="Mesangial",
+  "Monocytes"="Mono","MPP"="MPP","MSC"="MSC","mv Endothelial cells"="mv Endo","Myocytes"="Myocyte",
+  "naive B-cells"="naive B","Neurons"="Neuron","Neutrophils"="Neut","NK cells"="NK","NKT"="NKT",
+  "Osteoblast"="Osteo","pDC"="pDC","Pericytes"="Pericyte","Plasma cells"="Plasma","Platelets"="Platelet",
+  "Preadipocytes"="Preadipo","pro B-cells"="pro B","Sebocytes"="Sebo","Skeletal muscle"="Sk muscle",
+  "Smooth muscle"="Sm muscle","Tgd cells"="gd T","Th1 cells"="Th1","Th2 cells"="Th2","Tregs"="Tregs")
+colnames(cm) <- unname(short_map[colnames(cm)])
+colnames(pm) <- colnames(cm); colnames(fdr) <- colnames(cm)
+
+star <- ifelse(fdr < 0.001, "***", ifelse(fdr < 0.01, "**", ifelse(fdr < 0.05, "*", "")))
+disp <- ifelse(abs(cm) >= 0.30, sprintf("%.2f%s", cm, star), "")
+lim <- 0.70; brk <- seq(-lim, lim, length.out = 101)
+
+p <- pheatmap(cm, cluster_rows = FALSE, cluster_cols = FALSE,
+  display_numbers = disp, number_color = "black", fontsize_number = 4.4,
+  color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100), breaks = brk,
+  border_color = "grey92", angle_col = 90,
+  cellwidth = 12.6, cellheight = 19,
+  fontsize = 7, fontsize_col = 5.6, fontsize_row = 7.2,
+  legend = TRUE, silent = TRUE)
+
+pheatmap(cm, cluster_rows = FALSE, cluster_cols = FALSE,
+  display_numbers = disp, number_color = "black", fontsize_number = 4.4,
+  color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100), breaks = brk,
+  border_color = "grey92", angle_col = 90,
+  cellwidth = 12.6, cellheight = 19,
+  fontsize = 7, fontsize_col = 5.6, fontsize_row = 7.2,
+  legend = TRUE, filename = OUT, width = 7.0, height = 2.3)
+cat("columns kept:", ncol(cm), "\n")
+cat("output:", OUT, "\n")
+
+
+# =====================================================================
+# Section 3. xCell scores of cell types that differ between groups
+# =====================================================================
+suppressPackageStartupMessages({library(data.table); library(ggplot2)})
+
+ROOT <- XCELL_DIR
+
+d <- fread(file.path(ROOT, "tables", "xcell_scores_with_group.csv"))
+res <- fread(file.path(ROOT, "tables", "xcell_group_comparison.csv"))
+d[, group := factor(group, levels = c("Low", "High"))]
+
+## 5 cell types passing BH FDR < 0.05, ordered by P.
+sel <- res[FDR < 0.05][order(p), cell]
+cat("selected:", paste(sel, collapse = " | "), "\n")
+
+long <- melt(d[, c("sample", "group", sel), with = FALSE],
+             id.vars = c("sample", "group"), variable.name = "cell", value.name = "value")
+long[, cell := factor(cell, levels = sel)]
+
+lab <- long[, .(y = max(value, na.rm = TRUE) * 1.04), by = cell]
+lab <- merge(lab, res[, .(cell, p, FDR)], by = "cell", sort = FALSE)
+lab[, txt := paste0("P = ", formatC(p, format = "e", digits = 2),
+                    "\nFDR = ", formatC(FDR, format = "f", digits = 3))]
+
+g <- ggplot(long, aes(x = group, y = value, fill = group)) +
+  geom_boxplot(width = 0.62, outlier.size = 0.18, linewidth = 0.28) +
+  geom_text(data = lab, aes(x = 1.5, y = y, label = txt),
+            inherit.aes = FALSE, hjust = 0.5, vjust = 0,
+            size = 3.45, lineheight = 1.0) +
+  facet_wrap(~ cell, scales = "free_y", nrow = 1, labeller = label_wrap_gen(width = 16)) +
+  scale_fill_manual(values = c(Low = "#3B6FB6", High = "#C0392B"),
+                    labels = c(Low = "Low (n=350)", High = "High (n=84)"), name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.28))) +
+  labs(title = "xCell enrichment scores by six-gene score group",
+       subtitle = "5 of 67 cell types with BH FDR < 0.05; Wilcoxon High vs Low, TCGA-COAD n=434",
+       x = NULL, y = "xCell enrichment score") +
+  theme_bw(base_size = 11.0) +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "grey92", colour = "grey60", linewidth = 0.3),
+        strip.text = element_text(face = "bold", size = 10.0),
+        axis.text.x = element_text(size = 10.0),
+        axis.text.y = element_text(size = 9.8),
+        legend.position = "top",
+        legend.direction = "horizontal",
+        legend.key.size = unit(0.45, "cm"),
+        plot.title = element_text(size = 13.5, face = "bold"),
+        plot.subtitle = element_text(size = 10.0),
+        plot.margin = margin(6, 8, 4, 6))
+
+ggsave(file.path(ROOT, "figures", "01_xCell_significant_cells_by_group.png"),
+       g, width = 8.0, height = 4.5, dpi = 300)
+quartz(type = "pdf",
+       file = file.path(ROOT, "figures", "01_xCell_significant_cells_by_group.pdf"),
+       width = 8.0, height = 4.5)
+print(g); dev.off()
+
+fwrite(res[FDR < 0.05], file.path(ROOT, "tables", "xcell_significant_fdr005.csv"))
+cat("done\n")
+
+
+# =====================================================================
+# Section 4. ESTIMATE scores and tumour purity
+# =====================================================================
+suppressMessages({library(data.table); library(ggplot2)})
+
+OUT <- IMMUNE_DIR
+SRC <- ESTIMATE_DIR
+
+## ESTIMATE scores were computed on the same 434 tumours with the GSVA/estimate pipeline.
+est <- fread(file.path(SRC, "tables", "41_ESTIMATE_scores.csv"))
+expr <- as.data.frame(fread(EXPR_FILE))
+colnames(expr)[1] <- "gene"
+
+b6 <- c(FJX1 = 0.29497912, TIMP1 = 0.25555369, SRMS = 0.17331479,
+        ZBTB12 = 0.29670142, KPNA2 = -0.22294035, BGN = -0.03381982)
+stopifnot(all(names(b6) %in% expr$gene),
+          all(est$sample %in% names(expr)),
+          !anyDuplicated(expr$gene))
+
+X6 <- t(as.matrix(expr[match(names(b6), expr$gene), est$sample]))
+colnames(X6) <- names(b6)
+est[, score6 := as.numeric(X6 %*% b6)]
+est[, group6 := factor(ifelse(score6 > median(score6), "High", "Low"),
+                       levels = c("Low", "High"))]
+stopifnot(nrow(est) == 434, sum(est$group6 == "Low") == 217, sum(est$group6 == "High") == 217)
+
+## add BGN to the per-sample expression columns
+est <- merge(est, data.table(sample = est$sample, BGN = as.numeric(expr[match("BGN", expr$gene), est$sample])),
+             by = "sample")
+setorder(est, sample)
+
+met <- c("StromalScore", "ImmuneScore", "ESTIMATEScore", "TumorPurity")
+cmp <- rbindlist(lapply(met, function(m) {
+  lo <- est[group6 == "Low"][[m]]
+  hi <- est[group6 == "High"][[m]]
+  data.table(metric = m,
+             mean_low = mean(lo), mean_high = mean(hi),
+             diff_mean = mean(hi) - mean(lo),
+             p = wilcox.test(hi, lo)$p.value)
+}))
+cmp[, FDR := p.adjust(p, "BH")]
+
+fwrite(est[, .(sample, score6, group6, StromalScore, ImmuneScore, ESTIMATEScore, TumorPurity,
+               FJX1, TIMP1, SRMS, ZBTB12, KPNA2, BGN)],
+       file.path(OUT, "tables", "04_six_gene_ESTIMATE_scores.csv"))
+fwrite(cmp, file.path(OUT, "tables", "05_six_gene_ESTIMATE_group_comparison.csv"))
+
+lab <- c(StromalScore = "Stromal score", ImmuneScore = "Immune score",
+         ESTIMATEScore = "ESTIMATE score", TumorPurity = "Tumour purity")
+met_plot <- c("StromalScore", "ImmuneScore", "ESTIMATEScore")
+
+pl <- rbindlist(lapply(met_plot, function(m) {
+  data.table(metric = factor(lab[m], levels = lab),
+             value = est[[m]], group = est$group6)
+}))
+pl[, group := factor(group, levels = c("Low", "High"))]
+
+ymax <- pl[, .(y = max(value) * 0.96), by = metric]
+ann <- merge(cmp[metric %in% met_plot, .(metric = factor(lab[metric], levels = lab), p = p)],
+             ymax, by = "metric")
+
+p18 <- ggplot(pl, aes(group, value, fill = group)) +
+  geom_boxplot(width = 0.55, outlier.size = 0.35, linewidth = 0.35) +
+  facet_wrap(~metric, scales = "free_y", nrow = 1) +
+  scale_fill_manual(values = c(Low = "#3B6FB6", High = "#C0392B")) +
+  labs(x = NULL, y = NULL) +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "none",
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "grey92", colour = NA),
+        strip.text = element_text(size = 8.5)) +
+  geom_text(data = ann, aes(x = 1.5, y = y, label = sprintf("P = %.2g", p)),
+            inherit.aes = FALSE, size = 2.8, vjust = 1)
+
+ggsave(file.path(OUT, "figures", "fig18_six_gene_ESTIMATE_by_group.png"),
+       p18, width = 6.6, height = 2.9, dpi = 300)
+
+quartz(type = "pdf",
+       file = file.path(OUT, "figures", "fig18_six_gene_ESTIMATE_by_group.pdf"),
+       width = 6.6, height = 2.9)
+print(p18)
+dev.off()
+
+cat("n:", nrow(est), " low:", sum(est$group6 == "Low"), " high:", sum(est$group6 == "High"), "\n")
+cat("median score:", median(est$score6), " range:", paste(round(range(est$score6), 3), collapse = " to "), "\n")
+print(cmp)
+cat("done\n")
