@@ -1,0 +1,363 @@
+#!/usr/bin/env Rscript
+# =====================================================================
+# Script 7: ceRNA network of the six genes
+#   (a) miRNA-target predictions, selection rules and lncRNA-miRNA edges
+#   (b) mRNA-centred radial network layout
+# Source: six-gene ceRNA build and plotting scripts.
+# Inputs: archived five-gene prediction tables, BGN predictions, and the
+#         Starbase lincRNA-miRNA interaction table.
+# =====================================================================
+suppressPackageStartupMessages({library(data.table); library(igraph)})
+
+BASE     <- "/Users/zhangxiaocheng/Desktop/self"
+CERA_DIR <- file.path(BASE, "six_gene_ceRNA_20261117")
+dir.create(file.path(CERA_DIR, "tables"),  recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(CERA_DIR, "figures"), recursive = TRUE, showWarnings = FALSE)
+
+
+# =====================================================================
+# Section 1. Build the network: predictions, selection and edges
+# =====================================================================
+# Build the six-gene ceRNA network by extending the five-gene selection with BGN.
+# Five-gene selected miRNAs are kept exactly as in the archived five-gene analysis;
+# BGN is selected with the same rules: TargetScan/DIANA/miRanda intersection where
+# available, otherwise TargetScan, then keep miRNAs with >=1 Starbase lincRNA edge.
+
+root <- CERA_DIR
+tabdir <- file.path(root, "tables")
+dir.create(tabdir, showWarnings = FALSE, recursive = TRUE)
+
+genes <- c("FJX1", "TIMP1", "SRMS", "ZBTB12", "KPNA2", "BGN")
+
+# inputs from the five-gene analysis (read-only)
+pred5 <- read.csv(file.path(tabdir, "mirna_predictions_five.csv"), stringsAsFactors = FALSE)
+sel5  <- read.csv(file.path(tabdir, "mirna_selected_five.csv"), stringsAsFactors = FALSE)
+stat5 <- read.csv(file.path(tabdir, "mirna_selection_summary_five.csv"), stringsAsFactors = FALSE)
+sb <- read.delim(gzfile(file.path(tabdir, "lncRNA_miRNA_interaction.txt.gz")),
+                 stringsAsFactors = FALSE, check.names = FALSE)
+sb <- sb[sb$geneType == "lincRNA" & suppressWarnings(as.numeric(sb$clipExpNum)) > 4,
+         c("miRNAname", "geneName")]
+sb <- unique(sb)
+names(sb) <- c("miRNA", "lncRNA")
+
+bgn <- read.csv(file.path(tabdir, "BGN_mirna_predictions_raw.csv"), stringsAsFactors = FALSE)
+
+# combined predictions
+pred6 <- unique(rbind(pred5[, c("database", "miRNA", "target_gene")],
+                      bgn[, c("database", "miRNA", "target_gene")]))
+write.csv(pred6, file.path(tabdir, "mirna_predictions_six.csv"), row.names = FALSE)
+
+# BGN selection
+d  <- bgn[bgn$target_gene == "BGN", ]
+ts <- sort(unique(d$miRNA[d$database == "targetscan"]))
+dm <- sort(unique(d$miRNA[d$database == "diana_microt"]))
+md <- sort(unique(d$miRNA[d$database == "miranda"]))
+i3 <- Reduce(intersect, list(ts, dm, md))
+i2 <- intersect(ts, md)
+if (length(i3) > 0) {
+  pref <- i3; rule <- "TargetScan/DIANA/miRanda intersection"
+} else if (length(i2) > 0) {
+  pref <- i2; rule <- "TargetScan/miRanda intersection"
+} else {
+  pref <- ts; rule <- "TargetScan"
+}
+sb_mi <- unique(sb$miRNA)
+sel_bgn <- intersect(pref, sb_mi)
+used_rule <- rule
+if (length(sel_bgn) == 0) {
+  sel_bgn <- intersect(ts, sb_mi)
+  used_rule <- paste0(rule, " -> TargetScan fallback")
+}
+
+sel6 <- rbind(
+  sel5[, c("miRNA", "target_gene", "rule")],
+  data.frame(miRNA = sel_bgn, target_gene = "BGN", rule = used_rule,
+             stringsAsFactors = FALSE)
+)
+sel6 <- unique(sel6)
+write.csv(sel6, file.path(tabdir, "mirna_selected_six.csv"), row.names = FALSE)
+
+stat_bgn <- data.frame(
+  target_gene = "BGN",
+  n_targetscan = length(ts),
+  n_diana = length(dm),
+  n_miranda = length(md),
+  n_int3 = length(i3),
+  n_int2 = length(i2),
+  n_preferred = length(pref),
+  n_selected = length(sel_bgn),
+  rule = used_rule,
+  stringsAsFactors = FALSE
+)
+stat6 <- rbind(stat5, stat_bgn)
+write.csv(stat6, file.path(tabdir, "mirna_selection_summary_six.csv"), row.names = FALSE)
+
+# network
+tri <- merge(sel6[, c("miRNA", "target_gene")], sb, by = "miRNA")
+tri <- unique(tri[, c("miRNA", "lncRNA", "target_gene")])
+tri <- tri[order(tri$target_gene, tri$miRNA, tri$lncRNA), ]
+write.csv(tri, file.path(tabdir, "ceRNA_triplets_six.csv"), row.names = FALSE)
+
+ce <- data.frame(
+  miRNA = tri$miRNA,
+  target_gene = tri$target_gene,
+  miRNAname = tri$miRNA,
+  geneName = tri$lncRNA,
+  target_mRNA = tri$target_gene,
+  stringsAsFactors = FALSE
+)
+ce <- unique(ce)
+write.csv(ce, file.path(tabdir, "ceRNA_network_six.csv"), row.names = FALSE)
+
+edges_lnc  <- unique(data.frame(from = tri$miRNA, to = tri$lncRNA,
+                                edge_type = "miRNA-lncRNA", stringsAsFactors = FALSE))
+edges_mrna <- unique(data.frame(from = sel6$miRNA, to = sel6$target_gene,
+                                edge_type = "miRNA-mRNA", stringsAsFactors = FALSE))
+edges <- unique(rbind(edges_lnc, edges_mrna))
+write.csv(edges, file.path(tabdir, "ceRNA_edges_six.csv"), row.names = FALSE)
+
+nodes <- data.frame(name = unique(c(edges$from, edges$to)), stringsAsFactors = FALSE)
+nodes$type <- ifelse(nodes$name %in% genes, "mRNA",
+                     ifelse(grepl("^hsa-", nodes$name), "miRNA", "lncRNA"))
+
+suppressPackageStartupMessages(library(igraph))
+g <- graph_from_data_frame(edges[, c("from", "to")], vertices = nodes, directed = FALSE)
+V(g)$degree <- degree(g, mode = "all")
+V(g)$type   <- nodes$type[match(V(g)$name, nodes$name)]
+nodes$degree <- V(g)$degree[match(nodes$name, V(g)$name)]
+nodes <- nodes[order(match(nodes$type, c("mRNA", "miRNA", "lncRNA")),
+                     -nodes$degree, nodes$name), ]
+write.csv(nodes, file.path(tabdir, "ceRNA_nodes_six.csv"), row.names = FALSE)
+
+cat("Network statistics:\n")
+cat("  nodes:", vcount(g), " edges:", ecount(g), " density:", round(edge_density(g), 4), "\n")
+cat("  nodes by type:\n"); print(table(V(g)$type))
+cat("  components:", components(g)$no, "\n")
+cat("  isolated nodes:", ifelse(length(V(g)$name[degree(g) == 0]) == 0, "none",
+                                paste(V(g)$name[degree(g) == 0], collapse = ", ")), "\n")
+cat("  mRNA degrees:\n"); print(sort(degree(g)[genes], decreasing = TRUE))
+cat("  selected miRNAs per gene:\n"); print(table(sel6$target_gene))
+cat("  triplets per gene:\n"); print(table(tri$target_gene))
+cat("saved tables to", tabdir, "\n")
+
+
+
+# =====================================================================
+# Section 2. Radial network figure
+# =====================================================================
+# Six-gene ceRNA network, mRNA-centred radial layout, following the archived
+# five-gene fig20 style: orange mRNAs, blue miRNAs, teal lncRNAs, all labels,
+# sqrt(degree) node size, legend on the right.
+
+root <- CERA_DIR
+tabdir <- file.path(root, "tables")
+figdir <- file.path(root, "figures")
+dir.create(figdir, showWarnings = FALSE, recursive = TRUE)
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(tidygraph)
+  library(ggraph)
+  library(igraph)
+})
+
+ce <- read.csv(file.path(tabdir, "ceRNA_network_six.csv"), stringsAsFactors = FALSE)
+sel <- read.csv(file.path(tabdir, "mirna_selected_six.csv"), stringsAsFactors = FALSE)
+genes <- c("FJX1", "BGN", "KPNA2", "ZBTB12", "SRMS", "TIMP1")
+
+edges <- bind_rows(
+  ce %>% select(from = miRNA, to = target_mRNA),
+  ce %>% select(from = miRNA, to = geneName)
+) %>% distinct()
+
+nodes <- tibble(name = unique(c(edges$from, edges$to))) %>%
+  mutate(Type = case_when(
+    name %in% genes ~ "mRNA",
+    grepl("^hsa-", name) ~ "miRNA",
+    TRUE ~ "lncRNA"
+  ))
+
+graph <- graph_from_data_frame(edges, vertices = nodes, directed = FALSE)
+V(graph)$degree <- igraph::degree(graph)
+V(graph)$type <- V(graph)$Type
+
+targ <- ce %>% select(miRNA, target_mRNA) %>% distinct()
+miRNAs <- unique(targ$miRNA)
+
+# Assign each shared miRNA to the target gene with the fewest selected miRNAs.
+# This keeps the two BGN-SRMS miRNAs in the SRMS sector instead of collapsing
+# SRMS to a zero-width sector.
+sel_n <- table(factor(sel$target_gene, levels = genes))
+assign_primary <- function(m) {
+  tg <- targ$target_mRNA[targ$miRNA == m]
+  n <- as.numeric(sel_n[tg])
+  cand <- tg[n == min(n)]
+  if (length(cand) == 1) return(cand)
+  # deterministic tie-break: the first gene in the fixed circular order
+  cand[which.min(match(cand, genes))]
+}
+
+miRNA_info <- data.frame(
+  miRNA = miRNAs,
+  primary = vapply(miRNAs, assign_primary, character(1)),
+  degree = V(graph)$degree[match(miRNAs, V(graph)$name)],
+  stringsAsFactors = FALSE
+)
+
+group_order <- genes
+cnt <- table(factor(miRNA_info$primary, levels = group_order))
+# Gaps between successive sectors; the last gap closes the circle.
+gap_vec <- c(0.08, 0.08, 0.08, 0.30, 0.50, 0.08)
+avail <- 2 * pi - sum(gap_vec)
+widths <- avail * as.numeric(cnt) / sum(as.numeric(cnt))
+starts <- numeric(length(group_order))
+starts[1] <- 0
+for (i in 2:length(group_order)) {
+  starts[i] <- starts[i - 1] + widths[i - 1] + gap_vec[i - 1]
+}
+group_centers <- starts + widths / 2
+names(group_centers) <- group_order
+
+mrna_r <- 1.45
+mrna_df <- data.frame(
+  name = names(group_centers),
+  x = mrna_r * cos(group_centers),
+  y = mrna_r * sin(group_centers),
+  stringsAsFactors = FALSE
+)
+
+mi_list <- list()
+for (i in seq_along(group_order)) {
+  gname <- group_order[i]
+  sub <- miRNA_info %>%
+    filter(primary == gname) %>%
+    arrange(desc(degree), miRNA)
+  n <- nrow(sub)
+  if (n == 0) next
+  if (n == 1) {
+    angs <- group_centers[gname]
+  } else {
+    angs <- seq(starts[i] + gap_vec[i] / 2,
+                starts[i] + widths[i] - gap_vec[i] / 2,
+                length.out = n)
+  }
+  rads <- 5.0 + 0.32 * ((seq_len(n) - 1) %% 2)
+  mi_list[[gname]] <- data.frame(
+    name = sub$miRNA,
+    x = rads * cos(angs),
+    y = rads * sin(angs),
+    angle = angs,
+    stringsAsFactors = FALSE
+  )
+}
+miRNA_coords <- bind_rows(mi_list)
+
+lnc_mi <- ce %>% select(lncRNA = geneName, miRNA) %>% distinct()
+lncs <- unique(lnc_mi$lncRNA)
+ma <- setNames(miRNA_coords$angle, miRNA_coords$name)
+circ_mean <- function(a) {
+  if (length(a) == 0) return(NA_real_)
+  atan2(mean(sin(a)), mean(cos(a)))
+}
+lnc_info <- lapply(lncs, function(l) {
+  ms <- lnc_mi$miRNA[lnc_mi$lncRNA == l]
+  aa <- ma[ms]
+  aa <- aa[is.finite(aa)]
+  ca <- circ_mean(aa)
+  if (!is.finite(ca)) ca <- 0
+  data.frame(lncRNA = l, angle = ca, stringsAsFactors = FALSE)
+}) %>% bind_rows() %>% arrange(angle)
+
+m <- nrow(lnc_info)
+outer_ang <- seq(-pi, pi, length.out = m + 1)[-(m + 1)]
+lnc_info$angle2 <- outer_ang
+lnc_info$r <- 7.6 + 0.35 * ((seq_len(m) - 1) %% 3)
+lnc_info$x <- lnc_info$r * cos(lnc_info$angle2)
+lnc_info$y <- lnc_info$r * sin(lnc_info$angle2)
+
+coords <- bind_rows(
+  mrna_df,
+  miRNA_coords %>% select(name, x, y),
+  lnc_info %>% select(name = lncRNA, x, y)
+)
+stopifnot(all(V(graph)$name %in% coords$name), !anyDuplicated(coords$name))
+coords <- coords[match(V(graph)$name, coords$name), ]
+V(graph)$x <- coords$x
+V(graph)$y <- coords$y
+
+tidy_graph <- as_tbl_graph(graph)
+color_mapping <- c("miRNA" = "#7294D4",
+                   "lncRNA" = "#00A08A",
+                   "mRNA" = "#F98400")
+
+p <- ggraph(tidy_graph, layout = "manual", x = x, y = y) +
+  geom_edge_link(aes(width = 0.1), color = "#bac4d0", alpha = 0.18) +
+  geom_node_point(aes(size = sqrt(degree), color = Type), alpha = 0.75) +
+  geom_node_point(aes(filter = Type == "mRNA"),
+                  size = 9, color = "#F98400", alpha = 0.95,
+                  show.legend = FALSE) +
+  geom_node_text(aes(label = name, filter = Type != "mRNA"),
+                 repel = TRUE,
+                 size = 2.35,
+                 fontface = "bold",
+                 family = "Arial",
+                 color = "gray10",
+                 max.overlaps = Inf,
+                 force = 2,
+                 box.padding = 0.35,
+                 point.padding = 0.20,
+                 min.segment.length = 0) +
+  geom_node_text(aes(label = name, filter = Type == "mRNA"),
+                 repel = TRUE,
+                 size = 4.1,
+                 fontface = "bold",
+                 family = "Arial",
+                 color = "gray10",
+                 max.overlaps = Inf,
+                 force = 8,
+                 box.padding = 1.1,
+                 point.padding = 0.5,
+                 min.segment.length = 0) +
+  scale_color_manual(
+    values = color_mapping,
+    breaks = c("lncRNA", "miRNA", "mRNA"),
+    labels = c("lncRNA", "miRNA", "mRNA (six genes)")
+  ) +
+  scale_edge_width(range = c(0.5, 1.5)) +
+  scale_size(range = c(4, 9), breaks = c(1, 2, 3, 4, 5, 6, 7)) +
+  guides(
+    color = guide_legend(title = "Type", order = 1,
+                         override.aes = list(size = 4, alpha = 1)),
+    size = guide_legend(title = "sqrt(degree)", order = 2),
+    edge_width = guide_legend(title = "edge_width", order = 3)
+  ) +
+  coord_fixed(clip = "off") +
+  ggraph::theme_graph(base_family = "Arial", base_size = 11) +
+  theme(legend.position = "right",
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 10),
+        plot.margin = margin(12, 12, 12, 12))
+
+quartz(type = "pdf", file = file.path(figdir, "fig20_ceRNA_network_six.pdf"),
+       width = 12, height = 9.2, family = "Arial")
+print(p)
+dev.off()
+
+png(file.path(figdir, "fig20_ceRNA_network_six.png"),
+    width = 12, height = 9.2, res = 600, units = "in", family = "Arial")
+print(p)
+dev.off()
+
+cat("Network Statistics:\n")
+cat("Number of nodes:", vcount(graph), "\n")
+cat("Number of edges:", ecount(graph), "\n")
+cat("Network density:", edge_density(graph), "\n")
+cat("Nodes by type:\n"); print(table(V(graph)$Type))
+cat("miRNAs per mRNA sector:\n")
+print(data.frame(group = group_order,
+                 n = as.numeric(cnt),
+                 width_deg = round(widths * 180 / pi, 1),
+                 center_deg = round(group_centers * 180 / pi, 1)))
+cat("mRNA degrees:\n"); print(sort(degree(graph)[genes], decreasing = TRUE))
+cat("saved:", file.path(figdir, "fig20_ceRNA_network_six.pdf"), "\n")
+
