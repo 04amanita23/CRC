@@ -1,1 +1,1022 @@
+"""
+Script 1: Data loading, quality control, clustering and epithelial subtype annotation
+Source: code.ipynb (CRC scRNA-seq analysis)
+Note: Jupyter magics are commented out; file names that were originally in Chinese
+      have been translated to English and may need to be adjusted to the local paths.
+"""
 
+
+# --------------------------------------------------------------------
+# Data loading and metadata integration
+# --------------------------------------------------------------------
+
+import scanpy as sc
+adata=sc.read_text("/ZXL/data/GSE132465_GEO_processed_CRC_10X_raw_UMI_count_matrix (1).txt")
+
+import scanpy as sc
+import pandas as pd
+import numpy as np
+
+adata = adata.T  
+file_path = '/ZXL/data/GSE132465_GEO_processed_CRC_10X_cell_annotation.txt'
+meta_df = pd.read_table(file_path, sep='\t',index_col=0) 
+
+adata.obs = adata.obs.join(meta_df, how='left')
+
+adata.write_h5ad("/ZXL/data/singlecell_merged.h5ad")
+
+# --------------------------------------------------------------------
+# Quality control, normalization and feature selection
+# --------------------------------------------------------------------
+
+# import scanpy as sc
+
+import omicverse as ov
+import scanpy as sc
+adata=sc.read_h5ad("/ZXL/data/singlecell_merged.h5ad")
+
+adata.var["mt"] = adata.var_names.str.startswith("MT-")
+sc.pp.calculate_qc_metrics(
+    adata, 
+    qc_vars=["mt"], 
+    percent_top=[20], 
+    inplace=True, 
+    log1p=True
+)
+
+adata.layers["counts"] = adata.X.copy()
+
+sc.pp.normalize_total(adata, target_sum=1e4)
+
+sc.pp.log1p(adata)
+
+sc.pp.highly_variable_genes(
+    adata,
+    n_top_genes=3000,
+)
+
+sc.pl.highly_variable_genes(adata)
+
+adata.layers["scaled"] = adata.X
+sc.pp.regress_out(adata, ["total_counts", "pct_counts_mt"], layer="scaled")
+sc.pp.scale(adata, max_value=10, layer="scaled")
+
+# --------------------------------------------------------------------
+# Dimensionality reduction and clustering
+# --------------------------------------------------------------------
+
+sc.pp.pca(adata, layer="scaled", svd_solver="arpack")
+
+sc.pp.neighbors(adata, n_neighbors=10, n_pcs=40)
+
+sc.tl.umap(adata)
+
+sc.tl.leiden(adata,resolution=0.3)
+
+adata.write_h5ad("/ZXL/data/singlecell_umap.h5ad")
+
+import scanpy as sc
+adata=sc.read_h5ad("/ZXL/data/singlecell_umap.h5ad")
+
+sc.pl.umap(adata,color=["Cell_type"])
+
+# --------------------------------------------------------------------
+# Cell-type annotation and composition
+# --------------------------------------------------------------------
+
+import pandas as pd
+marker_dict = {
+    "B cells": ["CD19", "MS4A1", "CD79A", "PAX5"],
+    "Epithelial cells": ["EPCAM", "KRT8", "KRT18", "CDH1"],
+    "Mast cells": ["KIT", "TPSAB1", "TPSB2", "MS4A2"],
+    "Myeloids": ["CD68", "ITGAM", "CSF1R", "LYZ"],
+    "Stromal cells": ["COL1A1", "COL1A2", "PDGFRA", "VIM"],
+    "T cells": ["CD3D", "CD3E", "CD2", "TRAC"],
+    'NK cells': ['NCR1', 'KLRB1', 'NKG7', 'FCGR3A']
+}
+
+
+
+celltype_colors = {
+    "B cells": "#6B7ABB",
+    "Epithelial cells": "#F16E69",
+    "Mast cells": "#8AC4CC",
+    "Myeloids":  "#A5B45E",
+    "Stromal cells": "#C894BF",
+     "NK cells":"#BF5D85",
+    "T cells": "#FBAD36",
+   }
+  
+    
+    
+
+# Define the desired order (matching the color dictionary order)
+cell_type_order = list(celltype_colors.keys())  # use the dictionary keys as the order
+
+# Add imports at the beginning of the script
+from pandas.api.types import CategoricalDtype
+
+# Your existing code follows
+cell_type_order = list(celltype_colors.keys())
+adata.obs['cell_type'] = adata.obs['cell_type'].astype(
+    CategoricalDtype(categories=cell_type_order, ordered=True)
+)
+
+import os
+
+# Ensure the output directory exists
+save_dir = '/ZXL/TU'
+os.makedirs(save_dir, exist_ok=True)
+
+# Use the full path
+save_path = os.path.join(save_dir, '3.dotplot_celltype.pdf')
+
+ov.pl.dotplot(
+    adata, marker_dict,
+    groupby='cell_type', 
+    standard_scale='var', 
+    swap_axes=False,
+    var_group_rotation=45,
+    figsize=(10, 8),
+    save=save_path
+)
+
+import os
+import matplotlib.pyplot as plt
+
+# Ensure the output directory exists
+save_dir = '/ZXL/TU'
+os.makedirs(save_dir, exist_ok=True)
+
+# Plot without automatic saving
+ov.pl.dotplot(
+    adata, marker_dict,
+    groupby='cell_type', 
+    standard_scale='var', 
+    swap_axes=False,
+    var_group_rotation=45,
+    figsize=(10, 8),
+    show=False  # do not display automatically
+)
+
+# Save manually to the full path
+save_path = os.path.join(save_dir, '3.dotplot_celltype.pdf')
+plt.savefig(save_path, bbox_inches='tight', dpi=300)
+plt.close()  # close the figure to release memory
+
+marker_dict = {
+    "B cells": ["CD19", "MS4A1", "CD79A", "PAX5"],
+    "Epithelial cells": ["EPCAM", "KRT8", "KRT18", "CDH1"],
+    "Mast cells": ["KIT", "TPSAB1", "TPSB2", "MS4A2"],
+    "Myeloids": ["CD68", "ITGAM", "CSF1R", "LYZ"],
+    "Stromal cells": ["COL1A1", "COL1A2", "PDGFRA", "VIM"],
+    "T cells": ["CD3D", "CD3E", "CD2", "TRAC"],
+    'NK cells': ['NCR1', 'KLRB1', 'NKG7', 'FCGR3A']
+}
+import omicverse as ov
+import scanpy as sc
+
+# Define the cluster-to-cell_type mapping
+cluster_to_celltype = {
+    '0': 'T cells',
+    '1': 'NK cells',
+    '2': 'Epithelial cells',
+    '3': 'Myeloids',
+    '4': 'Epithelial cells',
+    '5': 'B cells',
+    '6': 'B cells',
+    '7': 'T cells',
+    '8': 'Epithelial cells',
+    '9': 'Stromal cells',
+    '10': 'Stromal cells',
+    '11': 'Epithelial cells',
+    '12': 'Stromal cells',
+    '13': 'B cells',
+    '14': 'Epithelial cells',
+    '15': 'Epithelial cells',
+    '17': 'Stromal cells',
+    '16': 'Epithelial cells',
+    '18':  'Myeloids',
+    '19': 'Mast cells',
+
+}
+
+# Convert cluster labels to cell_type
+adata.obs['cell_type'] = adata.obs['leiden'].map(cluster_to_celltype)
+
+celltype_colors = {
+    "B cells": "#6B7ABB",
+    "Epithelial cells": "#F16E69",
+    "Mast cells": "#8AC4CC",
+     "Myeloids":  "#A5B45E",
+       "Stromal cells": "#C894BF",
+    "T cells": "#FBAD36",
+    "NK cells":"#BF5D85",}
+   
+# Define the cell_type color mapping
+# Get the cell types that are actually present
+existing_celltypes = adata.obs['cell_type'].unique()
+
+# Assign colors in the order of the actual cell types (preserving dictionary order)
+ordered_colors = []
+for ct in sorted(existing_celltypes):  # to keep dictionary order, use: for ct in existing_celltypes
+    if ct in celltype_colors:
+        ordered_colors.append(celltype_colors[ct])
+    else:
+        # Use a default color if a cell type has no defined color
+        print(f"Warning: {ct} not found in color dictionary, using default")
+        ordered_colors.append("#CCCCCC")  # grey as the default color
+
+# Set the color mapping
+adata.uns['cell_type_colors'] = ordered_colors
+
+# Plot the UMAP and save
+ov.pl.umap(
+    adata, 
+    color=['cell_type'], 
+    s=20,
+    save='/ZXL/TU/1.CELL_TUPE.pdf'
+)
+
+# ov.pl.umap(
+#     adata, 
+#     color=['leiden'], 
+#     s=20,
+#     save='/ZXL/TU/S1_leiden.pdf'
+# )
+
+import omicverse as ov
+ov.pl.umap(
+    adata, 
+    color=['Class'], 
+    s=20,
+    save='/ZXL/TU/Class.pdf'
+)
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+import matplotlib.patches as mpatches
+import os
+import scanpy as sc
+
+# Set the color dictionary
+celltype_colors = {
+    "B cells": "#6B7ABB",
+    "Epithelial cells": "#F16E69",
+    "Mast cells": "#8AC4CC",
+     "Myeloids":  "#A5B45E",
+       "Stromal cells": "#C894BF",
+    "T cells": "#FBAD36",
+    "NK cells":"#BF5D85",}
+
+# Organize the color dictionary (must be defined)
+tissue_colors = {
+    'Normal': '#4CAF50',
+    'Tumor': '#F44336',
+   
+}
+
+# Set the column names
+col_sample = 'Sample'
+col_tissue = 'Class'
+col_celltype = 'cell_type'
+
+# Set the plotting parameters
+plt.rcParams['pdf.fonttype'] = 42
+plt.rcParams['ps.fonttype'] = 42
+
+# Create the output directory
+if not os.path.exists('plots'):
+    os.makedirs('plots')
+obs=adata.obs
+# ==================== Composition plot ====================
+# Assume obs is the AnnData obs data frame
+sample_meta = obs[[col_sample, col_tissue,]].drop_duplicates(subset=[col_sample]).set_index(col_sample)
+
+
+# Compute cell-type proportions
+props = pd.crosstab(obs[col_sample], obs[col_celltype], normalize='index') * 100
+
+# Order cell types according to the color dictionary
+ordered_cols = [c for c in celltype_colors.keys() if c in props.columns]
+props = props[ordered_cols]
+
+# Group by tissue order
+tissue_order = ['Normal', 'Tumor']
+grouped = sample_meta.groupby(col_tissue, observed=True)
+tissues_present = [t for t in tissue_order if t in grouped.groups]
+width_ratios = [len(grouped.groups[t]) for t in tissues_present]
+
+# Create the figure
+fig = plt.figure(figsize=(20, 6))
+gs = GridSpec(nrows=2, ncols=len(tissues_present), width_ratios=width_ratios,
+              height_ratios=[0.5, 10], wspace=0.08, hspace=0.05)
+
+axes_main = []
+
+for i, tissue in enumerate(tissues_present):
+    df_tissue = sample_meta[sample_meta[col_tissue] == tissue]
+    samples_in_tissue = df_tissue.index.tolist()
+    n_samples = len(samples_in_tissue)
+    
+    # Add the title
+    ax_title = fig.add_subplot(gs[0, i])
+    ax_title.axis('off')
+    color = tissue_colors.get(tissue, '#D3D3D3')
+    rect = mpatches.Rectangle((0, 0), 1, 1, transform=ax_title.transAxes,
+                              color=color, alpha=0.6, zorder=-1)
+    ax_title.add_patch(rect)
+    
+    # Show tissue names
+    if n_samples < 20:
+        ax_title.text(0.5, 0.5, tissue, ha='center', va='center', fontsize=11,
+                      fontweight='bold', transform=ax_title.transAxes,
+                      clip_on=False, zorder=100)
+    else:
+        ax_title.text(0.5, 0.5, tissue, ha='center', va='center', fontsize=13,
+                      fontweight='bold', transform=ax_title.transAxes, zorder=100)
+    
+    ax_title.set_xticks([])
+    ax_title.set_yticks([])
+    for spine in ax_title.spines.values():
+        spine.set_visible(False)
+    
+    # Add the main panel
+    if i == 0:
+        ax_main = fig.add_subplot(gs[1, i])
+        ax_main.set_ylabel('Percentage (%)', fontsize=12, fontweight='bold')
+    else:
+        ax_main = fig.add_subplot(gs[1, i], sharey=axes_main[0])
+        ax_main.set_yticks([])
+        ax_main.spines['left'].set_visible(False)
+    
+    axes_main.append(ax_main)
+    
+    # Draw the stacked bar plot
+    if n_samples > 0:
+        props_tissue = props.loc[samples_in_tissue]
+        colors = [celltype_colors[ct] for ct in ordered_cols]
+        
+        props_tissue.plot(kind='area', stacked=True, color=colors,
+                          ax=ax_main, legend=False, linewidth=0, alpha=1.0)
+        ax_main.set_xlim(0, n_samples - 1)
+    
+    ax_main.set_xticks([])
+    ax_main.set_xlabel('')
+    ax_main.set_ylim(0, 100)
+    ax_main.tick_params(axis='both', which='both', length=0)
+    
+    if i > 0:
+        ax_main.set_yticks([])
+        ax_main.spines['left'].set_visible(False)
+    
+    ax_main.spines['top'].set_visible(False)
+    ax_main.spines['right'].set_visible(False)
+
+# Add the legend
+handles_tissue = [mpatches.Patch(color=tissue_colors[k], label=k) for k in tissue_order]
+handles_cell = [mpatches.Patch(color=celltype_colors[k], label=k) for k in ordered_cols]
+
+leg1 = axes_main[-1].legend(handles=handles_tissue, title='Tissue', 
+                            bbox_to_anchor=(1.02, 1), loc='upper left', frameon=False)
+leg2 = axes_main[-1].legend(handles=handles_cell, title='Cell Types', 
+                            bbox_to_anchor=(1.02, 0.6), loc='upper left', frameon=False)
+axes_main[-1].add_artist(leg1)
+
+# Save the figure
+save_path = '/ZXL/TU/5.Composition.pdf'
+plt.savefig(save_path, bbox_inches='tight', transparent=True, format='pdf')
+plt.show()
+plt.close()
+
+# 4.1 - Task 2 assigned this week; the server changed, so the path was updated
+
+import scanpy as sc         # single-cell data processing
+import pandas as pd         # tabular data processing
+import matplotlib.pyplot as plt # plotting
+import seaborn as sns       # tabular plots
+import os                   # file paths
+cell_type_colors = {
+    "B cells": "#6B7ABB",
+    "Epithelial cells": "#F16E69",
+    "Mast cells": "#8AC4CC",
+     "Myeloids":  "#A5B45E",
+       "Stromal cells": "#C894BF",
+    "T cells": "#FBAD36",
+    "NK cells":"#BF5D85",}
+# Specified tissue order
+tissue_order = adata.obs["Sample"].unique()
+
+# Use cell names as color keys
+ordered_cell_types = list(cell_type_colors.keys())
+# Extract color codes in order for plotting
+colors_for_plot = [cell_type_colors[ct] for ct in ordered_cell_types]
+
+cdata = adata
+obs = cdata.obs.copy() # copy the data frame
+
+# crosstab: count cells of each cell_type within each tissue
+# normalize='index' treats each tissue row as 1 (100%) and computes each subtype proportion
+prop_df = pd.crosstab(obs['Sample'], obs['cell_type'], normalize='index') * 100
+
+# Reorder rows (tissue groups): Tumor, Fetal, Normal, MLN, NLN
+prop_df = prop_df.reindex(tissue_order)
+
+# Order columns (cell subtypes) by the palette and keep only cell names present in the table
+existing_cells = [ct for ct in ordered_cell_types if ct in prop_df.columns]
+prop_df = prop_df[existing_cells]
+colors_for_plot = [cell_type_colors[ct] for ct in existing_cells] # update colors accordingly
+
+##### plotting
+plt.rcParams['pdf.fonttype'] = 42
+plt.rcParams['ps.fonttype'] = 42
+# canvas
+fig, ax = plt.subplots(figsize=(12, 10))
+
+# kind='bar' draws bars
+# stacked=True stacks cells on top of each other
+# width=0.8 controls bar width
+prop_df.plot(kind='bar', stacked=True, color=colors_for_plot, ax=ax, width=0.75, edgecolor='white', linewidth=0.5)
+ax.set_ylim(0, 100) # y-axis from 0 to 100 (%)
+ax.set_ylabel('Percentage of Cells (%)', fontsize=12, fontweight='bold') # y-axis
+ax.set_xlabel('') 
+
+# Rotate x-axis labels to horizontal (0 degrees)
+plt.xticks(rotation=90, fontsize=11, fontweight='bold')
+# Hide the frame
+sns.despine()
+
+handles, labels = ax.get_legend_handles_labels()# move the legend outside the plot, upper right
+ax.legend(handles[::-1], labels[::-1], title='Cell Types', 
+          bbox_to_anchor=(1.05, 1), loc='upper left', frameon=False)
+# handles[::-1] reverses the legend order
+
+# Shrink the margins automatically so the legend is not clipped
+plt.tight_layout()
+
+save_dir = '/ZXL/TU'
+if not os.path.exists(save_dir):  
+    os.makedirs(save_dir)
+save_path = os.path.join(save_dir, '4.Sample_CellType_StackedBar.pdf')
+plt.savefig(save_path, bbox_inches='tight', transparent=True, format='pdf')
+
+# --------------------------------------------------------------------
+# Epithelial subset and subclustering
+# --------------------------------------------------------------------
+
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+import omicverse as ov
+
+ov.plot_set(font_path='Arial')
+
+# %reload_ext autoreload
+# %autoreload 2
+
+Epithelial_cells_adata=adata[adata.obs["Cell_type"]=="Epithelial cells"]
+
+sc.tl.umap(Epithelial_cells_adata)
+
+# Get differentially expressed genes for all groups
+all_results = sc.get.rank_genes_groups_df(
+    Epithelial_cells_adata,
+    group=None,  # all groups
+    key="rank_genes"
+)
+print(all_results.head())
+
+adata.obs
+
+sc.pl.umap(Epithelial_cells_adata,color=["Cell_subtype"])
+
+sc.tl.leiden(Epithelial_cells_adata,resolution=0.1)
+
+sc.pl.umap(Epithelial_cells_adata,color=["leiden"])
+
+# --------------------------------------------------------------------
+# Marker genes and subtype assignment
+# --------------------------------------------------------------------
+
+import scanpy as sc
+import pandas as pd
+
+# 1. Filter out single-cell groups
+group_counts = Epithelial_cells_adata.obs['leiden'].value_counts()
+single_cell_groups = group_counts[group_counts == 1].index.tolist()
+
+if len(single_cell_groups) > 0:
+    print(f"Filtered out single-cell groups: {single_cell_groups}")
+    # Create a filtered copy of adata
+    adata_filtered = Epithelial_cells_adata[
+        ~Epithelial_cells_adata.obs['leiden'].isin(single_cell_groups)
+    ].copy()
+else:
+    adata_filtered = Epithelial_cells_adata
+
+# 2. Run differential expression analysis
+sc.tl.rank_genes_groups(
+    adata_filtered, 
+    groupby="leiden", 
+    method="wilcoxon",
+    key_added="rank_genes"  # key under which results are stored
+)
+import scanpy as sc
+import pandas as pd
+
+# 1. Filter out single-cell groups
+group_counts = Epithelial_cells_adata.obs['leiden'].value_counts()
+single_cell_groups = group_counts[group_counts == 1].index.tolist()
+
+if len(single_cell_groups) > 0:
+    print(f"Filtered out single-cell groups: {single_cell_groups}")
+    # Create a filtered copy of adata
+    adata_filtered = Epithelial_cells_adata[
+        ~Epithelial_cells_adata.obs['leiden'].isin(single_cell_groups)
+    ].copy()
+else:
+    adata_filtered = Epithelial_cells_adata
+
+# 2. Run differential expression analysis
+sc.tl.rank_genes_groups(
+    adata_filtered, 
+    groupby="leiden", 
+    method="wilcoxon",
+    key_added="rank_genes"  # key under which results are stored
+)
+
+import scanpy as sc
+import omicverse as ov
+ov.plot_set(font_path='Arial')
+
+# Enable auto-reload for development
+# %load_ext autoreload
+# %autoreload 2
+all_results = sc.get.rank_genes_groups_df(
+    adata_filtered,
+    group=None,  # all groups
+    key="rank_genes"
+)
+
+# Inspect the data structure
+print(all_results.head())
+
+# Select significant genes (p value < 0.05)
+significant_genes = all_results[all_results['pvals_adj'] < 0.05].copy()
+
+# Or use a stricter threshold (p value < 0.01)
+# significant_genes = all_results[all_results['pvals_adj'] < 0.01].copy()
+
+print(f"Total DEGs: {len(all_results)}")
+print(f"Significant DEGs: {len(significant_genes)}")
+
+# Number of significant genes per group
+significant_counts = significant_genes.groupby('group').size()
+print("\nSignificant gene counts per group:")
+print(significant_counts)
+
+# Save all significant DEGs
+significant_genes.to_csv("significant_diff_genes_all.csv", index=False)
+
+# Or save each group separately
+for group in significant_genes['group'].unique():
+    group_df = significant_genes[significant_genes['group'] == group]
+    group_df.to_csv(f"significant_diff_genes_group_{group}.csv", index=False)
+    print(f"Group {group}: {len(group_df)} significant DEGs")
+
+data=pd.read_csv("/ZXL/significant_diff_genes_group_0.csv")
+data["names"].head(20)
+
+ov.pl.umap(Epithelial_cells_adata,color="leiden",save="/ZXL/TU2/1.EPI_UMAP_leiden.pdf")
+
+import scanpy as sc
+import pandas as pd
+
+# 1. Filter out single-cell groups
+group_counts = Epithelial_cells_adata.obs['leiden'].value_counts()
+single_cell_groups = group_counts[group_counts == 1].index.tolist()
+
+if len(single_cell_groups) > 0:
+    print(f"Filtered out single-cell groups: {single_cell_groups}")
+    # Create a filtered copy of adata
+    adata_filtered = Epithelial_cells_adata[
+        ~Epithelial_cells_adata.obs['leiden'].isin(single_cell_groups)
+    ].copy()
+else:
+    adata_filtered = Epithelial_cells_adata
+
+# # 2. Run differential expression analysis
+# sc.tl.rank_genes_groups(
+#     adata_filtered, 
+#     groupby="leiden", 
+#     method="wilcoxon",
+#     key_added="rank_genes"  # key under which results are stored
+# )
+# import scanpy as sc
+# import pandas as pd
+
+# # 1. Filter out single-cell groups
+# group_counts = Epithelial_cells_adata.obs['Sample'].value_counts()
+# single_cell_groups = group_counts[group_counts == 1].index.tolist()
+
+# if len(single_cell_groups) > 0:
+#     print(f"Filtered out single-cell groups: {single_cell_groups}")
+#     # Create a filtered copy of adata
+#     adata_filtered = Epithelial_cells_adata[
+#         ~Epithelial_cells_adata.obs['leiden'].isin(single_cell_groups)
+#     ].copy()
+# else:
+#     adata_filtered = Epithelial_cells_adata
+
+# 2. Run differential expression analysis
+# sc.tl.rank_genes_groups(
+#     adata_filtered, 
+#     groupby="Class", 
+#     method="wilcoxon",
+#     key_added="Tissue_genes"  # key under which results are stored
+# )
+
+all_results = sc.get.rank_genes_groups_df(
+    adata_filtered,
+    group=None,  # all groups
+    key="Tissue_genes"
+)
+
+# Inspect the data structure
+print(all_results.head())
+
+# Select significant genes (p value < 0.05)
+significant_genes = all_results[all_results['pvals_adj'] < 0.05].copy()
+
+# Or use a stricter threshold (p value < 0.01)
+# significant_genes = all_results[all_results['pvals_adj'] < 0.01].copy()
+
+print(f"Total DEGs: {len(all_results)}")
+print(f"Significant DEGs: {len(significant_genes)}")
+
+# Number of significant genes per group
+significant_counts = significant_genes.groupby('group').size()
+print("\nSignificant gene counts per group:")
+print(significant_counts)
+
+# Save all significant DEGs
+significant_genes.to_csv("/ZXL/TU3/significant_diff_genes_all.csv", index=False)
+
+# Or save each group separately
+for group in significant_genes['group'].unique():
+    group_df = significant_genes[significant_genes['group'] == group]
+    group_df.to_csv(f"significant_diff_genes_group_{group}.csv", index=False)
+    print(f"Group {group}: {len(group_df)} significant DEGs")
+all_results.to_csv("/ZXL/TU3/all_genes_all.csv", index=False)
+
+import pandas as pd
+import os
+
+# Base path
+base_path = '/ZXL/'
+output_path = '/ZXL/'  # output path (adjust as needed)
+
+# Process every group
+for i in range(8):  # group_0, group_1, group_2
+    # Build the file path
+    file_path = os.path.join(base_path, f'significant_diff_genes_group_{i}.csv')
+    
+    try:
+        # Read the data
+        df = pd.read_csv(file_path)
+        df=df.dropna(axis=0)
+        
+        # Inspect column names (can be commented out after the first run)
+        print(f"\n=== Group_{i} column names ===")
+        print(df.columns.tolist())
+        
+        # Filter: padj < 0.05 and logfoldchanges > 1
+        significant_genes = df[(df['pvals_adj'] < 0.05) & (df['logfoldchanges'] > 1)]
+        
+        # Sort by logfoldchanges in descending order and keep the top 50
+        top50_genes = significant_genes.sort_values('logfoldchanges', ascending=False).head(50)
+        
+        # Save the results
+        output_file = os.path.join(output_path, f'top50_significant_genes_group_{i}.csv')
+        top50_genes.to_csv(output_file, index=False)
+        
+        print(f"Group_{i}: {len(significant_genes)} significant DEGs selected")
+        print(f"Group_{i}: saved the top 50 genes to {output_file}")
+        
+    except FileNotFoundError:
+        print(f"Warning: Group_{i} file not found: {file_path}")
+    except KeyError as e:
+        print(f"Error: Group_{i} file is missing column {e}")
+        print("Check the column names; they may need to be changed to 'pvalue' or 'padj'")
+
+top50_genes
+
+sc.pl.umap(Epithelial_cells_adata,color=["leiden","Cell_subtype"])
+
+sc.pl.umap(
+    adata,
+    color="leiden",
+    legend_loc="on data",
+    legend_fontsize=12,
+    legend_fontoutline=2,
+    title="Leiden clusters"
+)
+
+# 0:CMS2
+# 1:CMS2
+# 2;CMS3
+# 3:Stem-like
+# 4:CMS2
+# 5:CMS2
+# 6:CMS1
+# 7:Mature Enterocytes type 1
+
+crc_epithelial_subtype_markers = {
+    # CMS1: MSI / immune-like / interferon / antigen presentation
+    # Often shows high IFN response, HLA and chemokine signals in pure epithelial data
+    "CMS1": [
+        "HLA-DRA", "HLA-DRB1", "HLA-DPA1", "HLA-DPB1",
+        "B2M", "TAP1", "STAT1", "IRF1",
+        "GBP1", "GBP2", "GBP5",
+        "CXCL9", "CXCL10", "CXCL11",
+        "IDO1"
+    ],
+
+    # CMS2: canonical / WNT-MYC / epithelial differentiation
+    "CMS2": [
+        "EPCAM", "KRT8", "KRT18", "KRT19",
+        "MYC", "AXIN2", "ASCL2", "LGR5",
+        "TCF7L2", "CCND1", "SOX9",
+        "OLFM4", "CDX1", "CDX2"
+    ],
+
+    # CMS3: metabolic / KRAS-like / goblet-metabolic program
+    "CMS3": [
+        "KRAS", "DUSP6", "ETV4", "ETV5", "SPRY2",
+        "MUC2", "TFF3", "AGR2", "SPINK4",
+        "FABP1", "FABP2", "APOA1", "APOA4",
+        "ALDOB", "SLC2A2", "SLC5A1"
+    ],
+
+    # CMS4: mesenchymal / EMT / TGF-beta / invasive-like
+    # Note that many markers may also reflect fibroblast contamination or stromal signal
+    "CMS4": [
+        "VIM", "FN1", "ZEB1", "ZEB2", "SNAI2",
+        "ITGA5", "ITGB6", "LAMC2", "TGFBI",
+        "SERPINE1", "THBS1", "AXL",
+        "SPARC", "COL1A1", "COL3A1"
+    ],
+
+    # Stem-like / transit-amplifying
+    "Stem-like/TA": [
+        "LGR5", "ASCL2", "OLFM4", "SMOC2", "SOX9",
+        "MKI67", "TOP2A", "STMN1", "TUBA1B",
+        "HMGB2", "PCNA", "UBE2C"
+    ],
+
+    # Mature absorptive enterocyte/colonocyte 1
+    "Mature Enterocytes type 1": [
+        "FABP1", "FABP2", "APOA1", "APOA4",
+        "ALPI", "SI", "SLC5A1", "SLC2A2",
+        "ACE2", "ANPEP"
+    ],
+
+    # Mature absorptive enterocyte/colonocyte 2, more colonic absorption/ion transport
+    "Mature Enterocytes type 2": [
+        "CA1", "CA2", "CA4", "AQP8",
+        "SLC26A3", "GUCA2A", "GUCA2B",
+        "BEST4", "OTOP2", "CA7"
+    ],
+
+    # Intermediate state, often at the absorptive-secretory transition or a tumor intermediate state
+    "Intermediate": [
+        "KRT8", "KRT18", "KRT19", "EPCAM",
+        "SOX9", "CDX2", "REG4",
+        "TFF3", "AGR2", "MUC13"
+    ],
+
+    # Goblet cells
+    "Goblet cells": [
+        "MUC2", "TFF3", "SPINK4", "FCGBP",
+        "CLCA1", "AGR2", "ZG16", "ITLN1",
+        "RETNLB", "REG4"
+    ]
+}
+
+cluster_to_subtype = {
+    "0": "CMS2",
+    "1": "CMS2",
+    "2": "CMS3",
+    "3": "Stem-like",
+    "4": "CMS2",
+    "5": "CMS2",
+    "6": "CMS1",
+    "7": "Mature Enterocytes type 1"
+}
+
+# Ensure leiden is a string
+adata.obs["leiden"] = adata.obs["leiden"].astype(str)
+
+# Map to adata
+adata.obs["Cell_subtype"] = adata.obs["leiden"].map(cluster_to_subtype)
+adata = adata[~pd.isna(adata.obs['Cell_subtype'])]
+# Check for unannotated clusters
+print(adata.obs["Cell_subtype"].value_counts(dropna=False))
+
+ov.pl.umap(
+    adata,
+    color="Cell_subtype",
+    legend_loc="on data",
+    legend_fontsize=12,
+    legend_fontoutline=2,
+    title="Leiden clusters"
+)
+
+adata.write_h5ad("/ZXL/subtypes/epithelial.h5ad")
+
+# --------------------------------------------------------------------
+# Subtype characterization: UMAP, markers, DEGs and pathway scores
+# --------------------------------------------------------------------
+
+import scanpy as sc
+adata=sc.read_h5ad("/ZXL/subtypes/epithelial.h5ad")
+
+import omicverse as ov
+
+nature_colors = ['#E64B35', '#4DBBD5', '#00A087', '#3C5488', '#F39B7F']
+
+ov.plot_set(font_path='Arial')
+
+# Save directly as PDF
+ov.pl.umap(adata, color=["Cell_subtype"], 
+           palette=nature_colors,
+           save='/ZXL/TU2/epithelial_umap_cell_subtypes.pdf')  # saved automatically
+
+marker_dict = {
+    # CMS1: MSI / immune-like / interferon / antigen presentation
+    # Often shows high IFN response, HLA and chemokine signals in pure epithelial data
+    "CMS1": [
+        
+        "PMS2", "STAT1"
+    ],
+
+    # CMS2: canonical / WNT-MYC / epithelial differentiation
+    "CMS2": [
+        
+        
+         "AXIN2", "ASCL2", 
+        "OLFM4"
+    ],
+
+    # CMS3: metabolic / KRAS-like / goblet-metabolic program
+    "CMS3": [
+        
+         "TFF3", "AGR2"
+    ],
+
+    "Stem-like/TA": [
+        "ARF4","MUC1"
+    ],
+
+    # Mature absorptive enterocyte/colonocyte 1
+    "Mature Enterocytes type 1": [
+        "FABP1", "FABP2", "APOA4",
+      
+    ],
+
+
+   
+}
+ov.pl.dotplot(
+    adata, marker_dict,
+    groupby='Cell_subtype', 
+    standard_scale='var', 
+    swap_axes=False,
+    var_group_rotation=45,
+    figsize=(10, 10),
+    save="/ZXL/TU2/dotplot.pdf"
+)
+
+sc.pl.umap(adata, color=["Cell_subtype"])
+
+sc.tl.rank_genes_groups(
+    adata, 
+    groupby="Cell_subtype", 
+    method="wilcoxon",
+    key_added="Cell_subtype_rank_genes" 
+)
+
+df = sc.get.rank_genes_groups_df(
+    adata,
+    group="Stem-like",  # all groups
+    key="Cell_subtype_rank_genes"
+)
+
+significant_genes = df[(df['pvals_adj'] < 0.05) & (df['logfoldchanges'] > 1)]
+
+adata.obs["Cell_subtype"].value_counts()
+
+import scanpy as sc
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+
+# Use the pathway dictionary defined above directly
+pathway = {
+    "Stemness": [
+        "LGR5", "ASCL2", "OLFM4", "SOX9", "PROM1",
+        "EPHB2", "CD44", "MSI1", "SMOC2", "AXIN2",
+    ],
+    "EMT": [
+        "VIM", "FN1", "ZEB1", "ZEB2", "SNAI1", "SNAI2",
+        "TWIST1", "ITGA5", "LAMC2", "SERPINE1", "TGFBI",
+    ],
+    "Inflammatory": [
+        "CXCL1", "CXCL2", "CXCL3", "CXCL5", "CXCL8",
+        "CCL20", "IL1B", "IL32", "NFKBIA", "TNFAIP3", "PTGS2",
+    ],
+    "Hypoxia": [
+        "VEGFA", "CA9", "SLC2A1", "LDHA", "ENO1",
+        "PGK1", "ALDOA", "BNIP3", "NDRG1", "ADM",
+    ],
+    "Interferon": [
+        "ISG15", "IFIT1", "IFIT2", "IFIT3", "IFI6",
+        "MX1", "OAS1", "OAS2", "STAT1", "IRF1", "CXCL10",
+    ],
+    "WNT": [
+        "AXIN2", "MYC", "ASCL2", "LGR5", "CCND1",
+        "TCF7L2", "LEF1", "EPHB2", "RNF43", "NKD1",
+    ],
+}
+
+End_col = {
+  "CMS2": "#C8A65D",
+  "CMS3": "#A5B45E",
+  "Stem-like": "#8AC4CC",
+  "CMS1": "#A8C97B",
+  "Mature Enterocytes type 1": "#BF5D85",
+}
+
+save_dir = "/ZXL/TU2"
+if not os.path.exists(save_dir):
+    os.makedirs(save_dir)
+
+available_cell_types = adata.obs['Cell_subtype'].unique().tolist()
+
+# Keep only cell types defined in End_col and present in the data
+desired_order = [cell_type for cell_type in End_col.keys() if cell_type in available_cell_types]
+
+# Create a color dictionary with only the available cell types
+available_colors = {cell_type: End_col[cell_type] for cell_type in desired_order}
+
+print(f"Cell types present in the data: {desired_order}")
+
+for pathway_name, genes in pathway.items():
+    try:
+        # Keep only genes present in adata
+        genes_in_data = [gene for gene in genes if gene in adata.var_names]
+        if len(genes_in_data) == 0:
+            print(f"No genes of pathway {pathway_name} are present in the data; skipping")
+            continue
+        
+        score_name = f"{pathway_name}_score"
+        sc.tl.score_genes(adata, genes_in_data, score_name=score_name)
+        
+        plt.rcParams['pdf.fonttype'] = 42
+        plt.rcParams['ps.fonttype'] = 42
+        fig, ax = plt.subplots(figsize=(9, 5), dpi=300)
+        
+        # Use available_colors and desired_order
+        sns.violinplot(
+            data=adata.obs, x="Cell_subtype", y=score_name,
+            order=desired_order, palette=available_colors,
+            inner=None, linewidth=0.8, ax=ax
+        )
+        sns.boxplot(
+            data=adata.obs, x="Cell_subtype", y=score_name,
+            order=desired_order, width=0.12, fliersize=0, showcaps=True,
+            boxprops={'facecolor': 'none', 'edgecolor': 'black', 'linewidth': 1},
+            whiskerprops={'color': 'black', 'linewidth': 1},
+            medianprops={'color': 'black', 'linewidth': 1.5},
+            ax=ax
+        )
+
+        ax.set_xlabel('')
+        ax.set_ylabel(f'{pathway_name} score', fontsize=11)
+        ax.set_xticklabels(desired_order, rotation=90, ha='center', fontsize=9)
+        ax.grid(False)
+        plt.tight_layout()
+        
+        pdf_path = os.path.join(save_dir, f"{pathway_name}_violin.pdf")
+        plt.savefig(pdf_path, dpi=300, bbox_inches='tight', transparent=True)
+        plt.close()
+        print(f"Pathway {pathway_name} processed; saved to {pdf_path}")
+        
+    except Exception as e:
+        print(f"Pathway {pathway_name} failed: {e}")
